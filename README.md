@@ -58,12 +58,6 @@ Due to licensing constraints with the original gall bladder cancer dataset:
 
 - [DINO-X API](https://github.com/IDEA-Research/DINO-X-API)
 - [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO)
-- CS672 Project Proposals Document
-## References
-
-- [DINO-X API](https://github.com/IDEA-Research/DINO-X-API)
-- [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO)
-- CS672 Project Proposals Document
 
 ### Contributors
 * Kaustav Goswami (DD25007)
