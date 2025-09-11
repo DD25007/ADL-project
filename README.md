@@ -33,6 +33,7 @@ Traditional object detection models struggle with false detections and mislocali
 ## Dataset
 
 * [Kaggle Link](https://www.kaggle.com/datasets/aryashah2k/breast-ultrasound-images-dataset)
+* [Hugging Face](https://huggingface.co/datasets/Amss007/ultrasound_dataset_v3_1)
 
 Due to licensing constraints with the original gall bladder cancer dataset:
 - **Alternative Sources**: Kaggle publicly available ultrasound images
