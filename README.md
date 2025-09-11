@@ -23,7 +23,7 @@ Traditional object detection models struggle with false detections and mislocali
 
 **Model Architecture**: DINO-Family (DINOv2, Grounding-DINO, DINO-X) with dual-mode prompt integration
 
-**Training Strategy**: 
+**Training Strategy**:
 - Train on annotated images with bounding boxes
 - Apply temporal processing for video clip extraction
 - Implement prompt tuning for domain alignment
@@ -31,6 +31,8 @@ Traditional object detection models struggle with false detections and mislocali
 **Image-to-Video Justification**: Spatial features learned from images transfer effectively to video frames. This approach leverages abundant annotated image datasets while maintaining computational efficiency compared to direct video training.
 
 ## Dataset
+
+* [Kaggle Link](https://www.kaggle.com/datasets/aryashah2k/breast-ultrasound-images-dataset)
 
 Due to licensing constraints with the original gall bladder cancer dataset:
 - **Alternative Sources**: Kaggle publicly available ultrasound images
