@@ -1,8 +1,8 @@
-## Getting Started
+# Getting Started
 
 The `./data` folder is added to `.gitignore` to avoid overloading local storage and will not be uploaded to this repo. Please follow the below steps to download and use the datasets.
 
-### Clone this git repo into your local machine
+## Clone this git repo into your local machine
 
 1. Make sure you have git installed in your system.
 
@@ -13,13 +13,13 @@ The `./data` folder is added to `.gitignore` to avoid overloading local storage 
     ```
 
 
-### Install python packages
+## Install python packages
 The following commands will create a python environment and downlaod the required packages.
 1. `python3 -m venv .venv`
 
 2. `pip install -r requirements.txt` 
 
-### Steps to Download and Extract Kaggle Dataset
+## Steps to Download and Extract Kaggle Dataset
 
 1. **Get Kaggle API Credentials**
 
@@ -41,7 +41,7 @@ The following commands will create a python environment and downlaod the require
 
     `!kaggle datasets download -d aryashah2k/breast-ultrasound-images-dataset -p ./data --unzip`
 
-### Steps to Download and Use Dataset from Hugging Face
+## Steps to Download and Use Dataset from Hugging Face
 
 1. **Get Hugging Face API Credentials**
     * Authenticate with Hugging Face `hf auth login`
