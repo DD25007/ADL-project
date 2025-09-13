@@ -65,5 +65,5 @@ Due to licensing constraints with the original gall bladder cancer dataset:
 
 ### Contributors
 * Kaustav Goswami (DD25007)
-* Mitanshi (s25046)
+* Mitanshi (S25046)
 * Lucky Rathore (S25021)
