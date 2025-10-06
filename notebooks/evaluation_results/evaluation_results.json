@@ -1,0 +1,47 @@
+{
+  "yolo_metrics": {
+    "model": "YOLO",
+    "precision": 0.0,
+    "recall": 0,
+    "f1_score": 0,
+    "tp": 0,
+    "fp": 1,
+    "fn": 0,
+    "total_predictions": 1,
+    "total_ground_truths": 0
+  },
+  "ablation": {
+    "Precision": {
+      "YOLO-only": 0
+    },
+    "Recall": {
+      "YOLO-only": 0
+    },
+    "F1-Score": {
+      "YOLO-only": 0
+    },
+    "TP": {
+      "YOLO-only": 0
+    },
+    "FP": {
+      "YOLO-only": 0
+    },
+    "FN": {
+      "YOLO-only": 0
+    }
+  },
+  "prompt_effectiveness": {
+    "Precision": {
+      "text_only": 0
+    },
+    "Recall": {
+      "text_only": 0
+    },
+    "F1-Score": {
+      "text_only": 0
+    },
+    "Total Detections": {
+      "text_only": 0
+    }
+  }
+}
