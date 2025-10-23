@@ -3,3 +3,7 @@
 /data
 .vscode
 models
+__pycache__/
+notebooks/.ipynb_checkpoints
+.DS_Store
+Thumbs.db
