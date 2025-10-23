@@ -10,7 +10,7 @@ imgsz: 640
 save: true
 save_period: -1
 cache: false
-device: cpu
+device: '0'
 workers: 8
 project: null
 name: train
@@ -103,4 +103,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: botsort.yaml
-save_dir: L:\_LUCKY_\_mtech\project\ADL-project\notebooks\runs\detect\train
+save_dir: /home/teaching/ADL-project/runs/detect/train

@@ -5,11 +5,11 @@
 
 YOLO Detection Metrics:
 -------------------------
-* mAP50:       0.0000
-* mAP50-95:    0.0000
-* Precision:   0.0000
-* Recall:      0.0000
-* F1-Score:    0.0000
+* mAP50:       0.0835
+* mAP50-95:    0.0424
+* Precision:   0.2929
+* Recall:      0.0693
+* F1-Score:    0.1121
 
 DINO Integration:
 -------------------------
