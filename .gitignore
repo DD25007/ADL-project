@@ -1,9 +1,10 @@
-/.venv
-/.keys
-/data
+.venv
+.keys
+data
 .vscode
 models
-__pycache__/
-notebooks/.ipynb_checkpoints
+__pycache__
+*checkpoints/
 .DS_Store
 Thumbs.db
+*.log
