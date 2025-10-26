@@ -59,6 +59,14 @@ class UltrasoundVideoDataset(Dataset):
             video["id"]: idx for idx, video in enumerate(self.videos)
         }
 
+        # Cache available frame filenames per video to avoid repeated os.listdir calls
+        # Maps video_name -> sorted list of frame filenames (strings)
+        self.video_frame_files = {}
+        for video in self.videos:
+            video_name = video["name"]
+            video_path = os.path.join(self.rawframes_dir, video_name)
+            self.video_frame_files[video_name] = self._get_all_frames_in_dir(video_path)
+
         # Parse annotations to get video labels
         self.video_labels = {}
         for ann in data["annotations"]:
@@ -97,38 +105,48 @@ class UltrasoundVideoDataset(Dataset):
 
     def _load_frame(self, video_path, frame_idx):
         """Load a single frame from disk."""
+        # Prefer cached listing (fast)
+        video_name = os.path.basename(video_path)
+        cached_files = self.video_frame_files.get(video_name, None)
+
+        # Primary expected filename
         frame_name = self.frame_format.format(frame_idx)
         frame_path = os.path.join(video_path, frame_name)
 
-        try:
-            frame = Image.open(frame_path).convert("RGB")
-        except FileNotFoundError:
-            # Try alternative naming conventions
-            alternatives = [
-                f"{frame_idx:05d}.jpg",
-                f"{frame_idx:04d}.jpg",
-                f"frame_{frame_idx:05d}.jpg",
-                f"img_{frame_idx:05d}.jpg",
-                f"{frame_idx:05d}.png",
-            ]
+        # Quick path: cached_files contains exact filename
+        if cached_files and frame_name in cached_files:
+            return Image.open(os.path.join(video_path, frame_name)).convert("RGB")
 
-            for alt_name in alternatives:
-                alt_path = os.path.join(video_path, alt_name)
+       # Try expected path
+        if os.path.exists(frame_path):
+            return Image.open(frame_path).convert("RGB")
+
+        # Try alternatives but using cached list first
+        alternatives = [
+            f"{frame_idx:05d}.jpg",
+            f"{frame_idx:04d}.jpg",
+            f"frame_{frame_idx:05d}.jpg",
+            f"img_{frame_idx:05d}.jpg",
+            f"{frame_idx:05d}.png",
+        ]
+
+        if cached_files:
+            for name in alternatives:
+                if name in cached_files:
+                    return Image.open(os.path.join(video_path, name)).convert("RGB")
+        else:
+            for name in alternatives:
+                alt_path = os.path.join(video_path, name)
                 if os.path.exists(alt_path):
-                    frame = Image.open(alt_path).convert("RGB")
-                    break
-            else:
-                # Fallback: use any available frame
-                all_frames = self._get_all_frames_in_dir(video_path)
-                if len(all_frames) > 0:
-                    fallback_path = os.path.join(video_path, all_frames[0])
-                    frame = Image.open(fallback_path).convert("RGB")
-                else:
-                    raise FileNotFoundError(
-                        f"Could not find any frames in {video_path}"
-                    )
+                    return Image.open(alt_path).convert("RGB")
 
-        return frame
+        # Fallback: use first available cached frame or first filesystem frame
+        all_frames = cached_files if cached_files is not None else self._get_all_frames_in_dir(video_path)
+        if len(all_frames) > 0:
+            fallback_path = os.path.join(video_path, all_frames[0])
+            return Image.open(fallback_path).convert("RGB")
+
+        raise FileNotFoundError(f"Could not find any frames in {video_path}")
 
     def _sample_frames(self, available_frames, num_frames):
         """Sample frame indices from available frames."""
@@ -261,6 +279,8 @@ def create_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2
     )
 
     val_loader = DataLoader(
@@ -269,6 +289,8 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2
     )
 
     return train_loader, val_loader
@@ -574,13 +596,11 @@ class KGANet(nn.Module):
         if keyframe_indices is None:
             keyframe_features = frame_features[:, 0:1, :, :, :]
         else:
-            keyframe_features = []
-            for video_idx in range(batch_size):
-                key_feats = frame_features[
-                    video_idx, keyframe_indices[video_idx], :, :, :
-                ]
-                keyframe_features.append(key_feats)
-            keyframe_features = torch.stack(keyframe_features, dim=0)
+            # keyframe_indices: (batch, k)
+            # Use torch.gather to avoid Python loop. Build index tensor of shape (batch, k, C, H, W)
+            k = keyframe_indices.shape[1]
+            idx = keyframe_indices.view(batch_size, k, 1, 1, 1).expand(-1, -1, feat_channels, feat_height, feat_width)
+            keyframe_features = torch.gather(frame_features, dim=1, index=idx)
 
         keyframe_center = self.kfc(keyframe_features)
         attended_features = self.kga(frame_features, keyframe_center)
@@ -618,51 +638,67 @@ def train_one_epoch(
     correct = 0
     total = 0
 
+    # Pre-create static criteria/aux modules to avoid per-batch allocations
+    cls_criterion = nn.CrossEntropyLoss()
+    if loss_type == "coherence":
+       aux_criterion = CoherenceLoss()
+       aux_requires_labels = False
+    elif loss_type == "triplet_coherence":
+        aux_criterion = TripletCoherenceLoss(margin=1.0)
+        aux_requires_labels = True
+    else:  # triplet_standard or default
+       aux_criterion = StandardTripletLoss(margin=1.0, mining="hard")
+       aux_requires_labels = True
+
+    use_amp = device.type == "cuda" and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     pbar = tqdm(train_loader, desc="Training")
     for frames, labels, keyframe_indices in pbar:
-        frames = frames.to(device)
-        labels = labels.to(device)
+        frames = frames.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         keyframe_indices = keyframe_indices.to(device)
 
         optimizer.zero_grad()
 
-        # Forward pass
-        logits, features = model(frames, keyframe_indices, return_features=True)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits, features = model(frames, keyframe_indices, return_features=True)
 
-        # Classification loss
-        cls_criterion = nn.CrossEntropyLoss()
-        cls_loss = cls_criterion(logits, labels)
+            # Add recovery from training errors
+            try:
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits, features = model(frames, keyframe_indices, return_features=True)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # Skip this batch
+                    logger.warning("OOM detected, skipping batch")
+                    optimizer.zero_grad()
+                    continue
+                raise e
 
-        # Auxiliary loss
-        batch_size, num_frames = frames.shape[0], frames.shape[1]
+            cls_loss = cls_criterion(logits, labels)
 
-        if loss_type == "coherence":
-            aux_criterion = CoherenceLoss()
-            aux_loss = aux_criterion(
-                features["frame_features"], features["keyframe_center"]
-            )
+            batch_size, num_frames = frames.shape[0], frames.shape[1]
+            if aux_requires_labels and loss_type == "triplet_standard":
+                frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
+                aux_loss = aux_criterion(features["frame_features"], frame_labels)
+            elif aux_requires_labels:  # triplet_coherence
+                frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
+                aux_loss = aux_criterion(
+                    features["frame_features"],
+                    features["keyframe_center"],
+                    frame_labels,
+                    labels,
+                )
+            else:  # coherence
+                aux_loss = aux_criterion(features["frame_features"], features["keyframe_center"])
 
-        elif loss_type == "triplet_coherence":
-            frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
-            aux_criterion = TripletCoherenceLoss(margin=1.0)
-            aux_loss = aux_criterion(
-                features["frame_features"],
-                features["keyframe_center"],
-                frame_labels,
-                labels,
-            )
-
-        elif loss_type == "triplet_standard":
-            frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
-            aux_criterion = StandardTripletLoss(margin=1.0, mining="hard")
-            aux_loss = aux_criterion(features["frame_features"], frame_labels)
-
-        # Combined loss
-        loss = cls_loss + alpha * aux_loss
-
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+            loss = cls_loss + alpha * aux_loss
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # Statistics
         total_loss += loss.item()
@@ -674,9 +710,8 @@ def train_one_epoch(
         correct += predicted.eq(labels).sum().item()
 
         # Update progress bar
-        pbar.set_postfix(
-            {"loss": f"{loss.item():.4f}", "acc": f"{100.*correct/total:.2f}%"}
-        )
+        pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{100. * correct / total:.2f}%"})
+ 
 
     avg_loss = total_loss / len(train_loader)
     avg_cls_loss = total_cls_loss / len(train_loader)
