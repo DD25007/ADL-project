@@ -117,7 +117,7 @@ class UltrasoundVideoDataset(Dataset):
         if cached_files and frame_name in cached_files:
             return Image.open(os.path.join(video_path, frame_name)).convert("RGB")
 
-       # Try expected path
+        # Try expected path
         if os.path.exists(frame_path):
             return Image.open(frame_path).convert("RGB")
 
@@ -141,7 +141,11 @@ class UltrasoundVideoDataset(Dataset):
                     return Image.open(alt_path).convert("RGB")
 
         # Fallback: use first available cached frame or first filesystem frame
-        all_frames = cached_files if cached_files is not None else self._get_all_frames_in_dir(video_path)
+        all_frames = (
+            cached_files
+            if cached_files is not None
+            else self._get_all_frames_in_dir(video_path)
+        )
         if len(all_frames) > 0:
             fallback_path = os.path.join(video_path, all_frames[0])
             return Image.open(fallback_path).convert("RGB")
@@ -280,7 +284,7 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2
+        prefetch_factor=2,
     )
 
     val_loader = DataLoader(
@@ -290,7 +294,7 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2
+        prefetch_factor=2,
     )
 
     return train_loader, val_loader
@@ -599,7 +603,9 @@ class KGANet(nn.Module):
             # keyframe_indices: (batch, k)
             # Use torch.gather to avoid Python loop. Build index tensor of shape (batch, k, C, H, W)
             k = keyframe_indices.shape[1]
-            idx = keyframe_indices.view(batch_size, k, 1, 1, 1).expand(-1, -1, feat_channels, feat_height, feat_width)
+            idx = keyframe_indices.view(batch_size, k, 1, 1, 1).expand(
+                -1, -1, feat_channels, feat_height, feat_width
+            )
             keyframe_features = torch.gather(frame_features, dim=1, index=idx)
 
         keyframe_center = self.kfc(keyframe_features)
@@ -620,11 +626,17 @@ class KGANet(nn.Module):
 
         return logits
 
+    # Add parameter groups for different learning rates
+    def get_parameter_groups(self):
+        return [
+            {"params": self.backbone.parameters(), "lr_mult": 0.1},
+            {"params": self.classifier.parameters(), "lr_mult": 1.0},
+        ]
+
 
 # ============================================================================
 # TRAINING AND EVALUATION FUNCTIONS
 # ============================================================================
-
 
 def train_one_epoch(
     model, train_loader, optimizer, device, loss_type="triplet_standard", alpha=0.5
@@ -641,33 +653,35 @@ def train_one_epoch(
     # Pre-create static criteria/aux modules to avoid per-batch allocations
     cls_criterion = nn.CrossEntropyLoss()
     if loss_type == "coherence":
-       aux_criterion = CoherenceLoss()
-       aux_requires_labels = False
+        aux_criterion = CoherenceLoss()
+        aux_requires_labels = False
     elif loss_type == "triplet_coherence":
         aux_criterion = TripletCoherenceLoss(margin=1.0)
         aux_requires_labels = True
     else:  # triplet_standard or default
-       aux_criterion = StandardTripletLoss(margin=1.0, mining="hard")
-       aux_requires_labels = True
+        aux_criterion = StandardTripletLoss(margin=1.0, mining="hard")
+        aux_requires_labels = True
 
     use_amp = device.type == "cuda" and torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     pbar = tqdm(train_loader, desc="Training")
-    for frames, labels, keyframe_indices in pbar:
+    for batch_idx, (frames, labels, keyframe_indices) in enumerate(pbar):
         frames = frames.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         keyframe_indices = keyframe_indices.to(device)
 
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda",enabled=use_amp):
             logits, features = model(frames, keyframe_indices, return_features=True)
 
             # Add recovery from training errors
             try:
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, features = model(frames, keyframe_indices, return_features=True)
+                    logits, features = model(
+                        frames, keyframe_indices, return_features=True
+                    )
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     if torch.cuda.is_available():
@@ -693,7 +707,9 @@ def train_one_epoch(
                     labels,
                 )
             else:  # coherence
-                aux_loss = aux_criterion(features["frame_features"], features["keyframe_center"])
+                aux_loss = aux_criterion(
+                    features["frame_features"], features["keyframe_center"]
+                )
 
             loss = cls_loss + alpha * aux_loss
         scaler.scale(loss).backward()
@@ -710,8 +726,13 @@ def train_one_epoch(
         correct += predicted.eq(labels).sum().item()
 
         # Update progress bar
-        pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{100. * correct / total:.2f}%"})
- 
+        pbar.set_postfix(
+            {"loss": f"{loss.item():.4f}", "acc": f"{100. * correct / total:.2f}%"}
+        )
+
+        # Clear cache periodically
+        if torch.cuda.is_available() and (batch_idx + 1) % 10 == 0:
+            torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(train_loader)
     avg_cls_loss = total_cls_loss / len(train_loader)
@@ -881,7 +902,7 @@ def train_kga_net(
 
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}_{loss_type}.pth")
             torch.save(
                 {
                     "epoch": epoch,
@@ -968,7 +989,7 @@ if __name__ == "__main__":
                 batch_size=BATCH_SIZE,
                 num_frames=NUM_FRAMES,
                 learning_rate=LEARNING_RATE,
-                loss_type=LOSS_TYPE,
+                loss_type=loss_type,
                 alpha=ALPHA,
                 save_dir=SAVE_DIR,
             )
@@ -985,7 +1006,7 @@ if __name__ == "__main__":
             print("=" * 70)
 
             # Load best model
-            checkpoint_path = os.path.join(SAVE_DIR, f"best_model_{LOSS_TYPE}.pth")
+            checkpoint_path = os.path.join(SAVE_DIR, f"best_model_{loss_type}.pth")
             if os.path.exists(checkpoint_path):
                 checkpoint = torch.load(checkpoint_path)
                 trained_model.load_state_dict(checkpoint["model_state_dict"])
