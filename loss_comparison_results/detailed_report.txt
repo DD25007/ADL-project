@@ -1,0 +1,158 @@
+================================================================================
+KGA-NET LOSS FUNCTION COMPARISON - DETAILED REPORT
+================================================================================
+Generated: 2025-10-29 00:34:46
+Number of models compared: 3
+================================================================================
+
+OVERALL PERFORMANCE RANKING
+--------------------------------------------------------------------------------
+1. Coherence: 70.27% accuracy
+2. Triplet Coherence: 70.27% accuracy
+3. Standard Triplet: 64.86% accuracy
+
+================================================================================
+COHERENCE
+================================================================================
+Description: Basic MSE-based coherence loss
+Checkpoint: notebooks/checkpoints/best_model_coherence.pth
+Trained Epoch: 6
+Training Accuracy: 81.87919463087249
+
+OVERALL METRICS:
+  Overall Accuracy:     70.27%
+  ROC AUC:              0.7051
+  Average Precision:    0.8010
+  F1 Score:             0.7556
+
+PER-CLASS METRICS:
+  Benign Accuracy:      69.23%
+  Malignant Accuracy:   70.83%
+  Sensitivity (Recall): 0.7083
+  Specificity:          0.6923
+
+CONFUSION MATRIX:
+                    Predicted
+                Benign  Malignant
+Actual Benign        9       4
+       Malignant     7      17
+
+ERROR ANALYSIS:
+  False Positives (Benign → Malignant):   4
+  False Negatives (Malignant → Benign):   7
+  Total Errors:                           11
+
+CONFIDENCE STATISTICS:
+  Overall Mean Confidence:       0.7913
+  Correct Predictions Mean:      0.7876
+  Incorrect Predictions Mean:    0.8001
+  Confidence Std Dev:            0.1303
+
+================================================================================
+TRIPLET COHERENCE
+================================================================================
+Description: Keyframe-guided triplet loss
+Checkpoint: notebooks/checkpoints/best_model_triplet_coherence.pth
+Trained Epoch: 13
+Training Accuracy: 69.12751677852349
+
+OVERALL METRICS:
+  Overall Accuracy:     70.27%
+  ROC AUC:              0.5801
+  Average Precision:    0.7092
+  F1 Score:             0.8136
+
+PER-CLASS METRICS:
+  Benign Accuracy:      15.38%
+  Malignant Accuracy:   100.00%
+  Sensitivity (Recall): 1.0000
+  Specificity:          0.1538
+
+CONFUSION MATRIX:
+                    Predicted
+                Benign  Malignant
+Actual Benign        2      11
+       Malignant     0      24
+
+ERROR ANALYSIS:
+  False Positives (Benign → Malignant):   11
+  False Negatives (Malignant → Benign):   0
+  Total Errors:                           11
+
+CONFIDENCE STATISTICS:
+  Overall Mean Confidence:       0.8657
+  Correct Predictions Mean:      0.8575
+  Incorrect Predictions Mean:    0.8850
+  Confidence Std Dev:            0.1357
+
+================================================================================
+STANDARD TRIPLET
+================================================================================
+Description: Standard triplet loss with hard mining
+Checkpoint: notebooks/checkpoints/best_model_triplet_standard.pth
+Trained Epoch: 0
+Training Accuracy: 50.33557046979866
+
+OVERALL METRICS:
+  Overall Accuracy:     64.86%
+  ROC AUC:              0.3910
+  Average Precision:    0.6296
+  F1 Score:             0.7869
+
+PER-CLASS METRICS:
+  Benign Accuracy:      0.00%
+  Malignant Accuracy:   100.00%
+  Sensitivity (Recall): 1.0000
+  Specificity:          0.0000
+
+CONFUSION MATRIX:
+                    Predicted
+                Benign  Malignant
+Actual Benign        0      13
+       Malignant     0      24
+
+ERROR ANALYSIS:
+  False Positives (Benign → Malignant):   13
+  False Negatives (Malignant → Benign):   0
+  Total Errors:                           13
+
+CONFIDENCE STATISTICS:
+  Overall Mean Confidence:       0.6563
+  Correct Predictions Mean:      0.6562
+  Incorrect Predictions Mean:    0.6567
+  Confidence Std Dev:            0.0018
+
+================================================================================
+COMPARATIVE ANALYSIS
+================================================================================
+
+BEST PERFORMERS BY METRIC:
+  Highest Accuracy                   : Coherence (70.27%)
+  Highest ROC AUC                    : Coherence (0.7051)
+  Highest Average Precision          : Coherence (0.8010)
+  Highest F1 Score                   : Triplet Coherence (0.8136)
+  Highest Sensitivity                : Triplet Coherence (1.0000)
+  Highest Specificity                : Coherence (0.6923)
+
+RECOMMENDATIONS:
+--------------------------------------------------------------------------------
+1. BEST OVERALL: Coherence
+   - Highest accuracy: 70.27%
+   - Recommended for general use
+
+2. BEST FOR MALIGNANT DETECTION: Triplet Coherence
+   - Highest sensitivity: 1.0000
+   - Recommended when missing malignant cases is critical
+
+3. BEST FOR REDUCING FALSE ALARMS: Coherence
+   - Highest specificity: 0.6923
+   - Recommended when reducing false positives is important
+
+4. MOST BALANCED: Coherence
+   - Sensitivity: 0.7083, Specificity: 0.6923
+   - Difference: 0.0160
+   - Recommended for balanced performance
+
+================================================================================
+END OF REPORT
+================================================================================

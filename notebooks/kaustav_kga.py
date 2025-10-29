@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet50, ResNet50_Weights
+from torch.utils.checkpoint import checkpoint
 import json
 import os
 from PIL import Image
@@ -59,14 +60,6 @@ class UltrasoundVideoDataset(Dataset):
             video["id"]: idx for idx, video in enumerate(self.videos)
         }
 
-        # Cache available frame filenames per video to avoid repeated os.listdir calls
-        # Maps video_name -> sorted list of frame filenames (strings)
-        self.video_frame_files = {}
-        for video in self.videos:
-            video_name = video["name"]
-            video_path = os.path.join(self.rawframes_dir, video_name)
-            self.video_frame_files[video_name] = self._get_all_frames_in_dir(video_path)
-
         # Parse annotations to get video labels
         self.video_labels = {}
         for ann in data["annotations"]:
@@ -105,52 +98,38 @@ class UltrasoundVideoDataset(Dataset):
 
     def _load_frame(self, video_path, frame_idx):
         """Load a single frame from disk."""
-        # Prefer cached listing (fast)
-        video_name = os.path.basename(video_path)
-        cached_files = self.video_frame_files.get(video_name, None)
-
-        # Primary expected filename
         frame_name = self.frame_format.format(frame_idx)
         frame_path = os.path.join(video_path, frame_name)
 
-        # Quick path: cached_files contains exact filename
-        if cached_files and frame_name in cached_files:
-            return Image.open(os.path.join(video_path, frame_name)).convert("RGB")
+        try:
+            frame = Image.open(frame_path).convert("RGB")
+        except FileNotFoundError:
+            # Try alternative naming conventions
+            alternatives = [
+                f"{frame_idx:05d}.jpg",
+                f"{frame_idx:04d}.jpg",
+                f"frame_{frame_idx:05d}.jpg",
+                f"img_{frame_idx:05d}.jpg",
+                f"{frame_idx:05d}.png",
+            ]
 
-        # Try expected path
-        if os.path.exists(frame_path):
-            return Image.open(frame_path).convert("RGB")
-
-        # Try alternatives but using cached list first
-        alternatives = [
-            f"{frame_idx:05d}.jpg",
-            f"{frame_idx:04d}.jpg",
-            f"frame_{frame_idx:05d}.jpg",
-            f"img_{frame_idx:05d}.jpg",
-            f"{frame_idx:05d}.png",
-        ]
-
-        if cached_files:
-            for name in alternatives:
-                if name in cached_files:
-                    return Image.open(os.path.join(video_path, name)).convert("RGB")
-        else:
-            for name in alternatives:
-                alt_path = os.path.join(video_path, name)
+            for alt_name in alternatives:
+                alt_path = os.path.join(video_path, alt_name)
                 if os.path.exists(alt_path):
-                    return Image.open(alt_path).convert("RGB")
+                    frame = Image.open(alt_path).convert("RGB")
+                    break
+            else:
+                # Fallback: use any available frame
+                all_frames = self._get_all_frames_in_dir(video_path)
+                if len(all_frames) > 0:
+                    fallback_path = os.path.join(video_path, all_frames[0])
+                    frame = Image.open(fallback_path).convert("RGB")
+                else:
+                    raise FileNotFoundError(
+                        f"Could not find any frames in {video_path}"
+                    )
 
-        # Fallback: use first available cached frame or first filesystem frame
-        all_frames = (
-            cached_files
-            if cached_files is not None
-            else self._get_all_frames_in_dir(video_path)
-        )
-        if len(all_frames) > 0:
-            fallback_path = os.path.join(video_path, all_frames[0])
-            return Image.open(fallback_path).convert("RGB")
-
-        raise FileNotFoundError(f"Could not find any frames in {video_path}")
+        return frame
 
     def _sample_frames(self, available_frames, num_frames):
         """Sample frame indices from available frames."""
@@ -313,12 +292,29 @@ class KeyframeFeatureCenter(nn.Module):
         self.feature_dim = feature_dim
 
     def forward(self, keyframe_features):
+        """
+        Compute the center of keyframe features by averaging.
+
+        Args:
+            keyframe_features: Tensor of shape (batch_size, num_keyframes, channels, height, width)
+                - batch_size: Number of videos in the batch
+                - num_keyframes: Number of keyframes per video
+                - channels: Number of feature channels (e.g., 2048 for ResNet-50)
+                - height: Spatial height of feature maps
+                - width: Spatial width of feature maps
+
+        Returns:
+            center: Tensor of shape (batch_size, channels, height, width)
+                - Averaged keyframe features representing the keyframe center
+        """
         center = torch.mean(keyframe_features, dim=1)
         return center
 
 
 class KeyframeGuidanceAttention(nn.Module):
-    """Keyframe Guidance Attention (KGA) module."""
+    """
+    Keyframe Guidance Attention (KGA) module
+    Uses keyframe feature center to guide attention on video frames"""
 
     def __init__(self, feature_dim, reduction=16):
         super(KeyframeGuidanceAttention, self).__init__()
@@ -351,7 +347,7 @@ class KeyframeGuidanceAttention(nn.Module):
 
 
 class TemporalAggregation(nn.Module):
-    """Temporal aggregation module."""
+    """Temporal aggregation module to combine frame-level features"""
 
     def __init__(self, feature_dim, aggregation_type="avg"):
         super(TemporalAggregation, self).__init__()
@@ -365,6 +361,12 @@ class TemporalAggregation(nn.Module):
             )
 
     def forward(self, features):
+        """
+        Args:
+            features: (Batch_size, num_frames, Channels, Height, Width) - frame features
+        Returns:
+            aggregated: (Batch_size, Channels, Height, Width) - temporally aggregated features
+        """
         if self.aggregation_type == "avg":
             aggregated = torch.mean(features, dim=1)
         elif self.aggregation_type == "max":
@@ -405,13 +407,25 @@ class CoherenceLoss(nn.Module):
 
 
 class TripletCoherenceLoss(nn.Module):
-    """Custom Triplet Loss with keyframe center as anchor."""
+    """
+    Uses keyframe center as anchor, same-class frames as positive,
+    different-class frames as negative
+    """
 
     def __init__(self, margin=1.0):
         super(TripletCoherenceLoss, self).__init__()
         self.margin = margin
 
     def forward(self, frame_features, keyframe_center, labels, keyframe_labels):
+        """
+        Args:
+            frame_features: (Batch_size, num_frames, Channels, Height, Width) - features from all frames
+            keyframe_center: (Batch_size, Channels, Height, Width) - keyframe feature center
+            labels: (Batch_size, num_frames) - labels for each frame in video
+            keyframe_labels: (Batch_size,) - labels for keyframe center
+        Returns:
+            loss: scalar - triplet loss value
+        """
         batch_size, num_frames, channels, height, width = frame_features.shape
 
         keyframe_center_vec = F.adaptive_avg_pool2d(keyframe_center, 1).view(
@@ -456,12 +470,16 @@ class TripletCoherenceLoss(nn.Module):
 
 
 class StandardTripletLoss(nn.Module):
-    """Standard Triplet Loss with mining strategies."""
+    """Standard Triplet Loss with mining strategies.
+    Args:
+        margin: Margin for triplet loss
+        mining: Mining strategy - 'hard', 'semi-hard', or 'all'
+    """
 
     def __init__(self, margin=1.0, mining="hard"):
         super(StandardTripletLoss, self).__init__()
         self.margin = margin
-        self.mining = mining
+        self.mining = mining  # 'hard', 'semi-hard', or 'all'
 
         if mining == "all":
             import warnings
@@ -551,7 +569,15 @@ class StandardTripletLoss(nn.Module):
 
 
 class KGANet(nn.Module):
-    """KGA-Net: Keyframe Guidance Attention Network."""
+    """KGA-Net: Keyframe Guidance Attention Network.
+    Args:
+        num_classes: Number of output classes
+        feature_dim: Dimension of feature maps from backbone
+        reduction: Reduction ratio for KGA module
+        aggregation_type: 'avg', 'max', or 'attention' for temporal aggregation
+        pretrained: Whether to use pretrained backbone
+        use_gradient_checkpointing: Whether to use gradient checkpointing
+    """
 
     def __init__(
         self,
@@ -560,10 +586,11 @@ class KGANet(nn.Module):
         reduction=16,
         aggregation_type="attention",
         pretrained=True,
+        use_gradient_checkpointing=True,
     ):
         super(KGANet, self).__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
-        # Use new weights parameter instead of deprecated pretrained
         if pretrained:
             weights = ResNet50_Weights.IMAGENET1K_V1
         else:
@@ -586,6 +613,7 @@ class KGANet(nn.Module):
         )
 
     def forward(self, video_frames, keyframe_indices=None, return_features=False):
+
         batch_size, num_frames, rgb_channels, height, width = video_frames.shape
 
         frames_flat = video_frames.view(
@@ -638,6 +666,7 @@ class KGANet(nn.Module):
 # TRAINING AND EVALUATION FUNCTIONS
 # ============================================================================
 
+
 def train_one_epoch(
     model, train_loader, optimizer, device, loss_type="triplet_standard", alpha=0.5
 ):
@@ -650,7 +679,6 @@ def train_one_epoch(
     correct = 0
     total = 0
 
-    # Pre-create static criteria/aux modules to avoid per-batch allocations
     cls_criterion = nn.CrossEntropyLoss()
     if loss_type == "coherence":
         aux_criterion = CoherenceLoss()
@@ -658,81 +686,99 @@ def train_one_epoch(
     elif loss_type == "triplet_coherence":
         aux_criterion = TripletCoherenceLoss(margin=1.0)
         aux_requires_labels = True
-    else:  # triplet_standard or default
+    else:
         aux_criterion = StandardTripletLoss(margin=1.0, mining="hard")
         aux_requires_labels = True
 
-    use_amp = device.type == "cuda" and torch.cuda.is_available()
+    use_amp = device == "cuda" and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # Clear cache before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     pbar = tqdm(train_loader, desc="Training")
     for batch_idx, (frames, labels, keyframe_indices) in enumerate(pbar):
-        frames = frames.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        keyframe_indices = keyframe_indices.to(device)
+        # Skip batch if OOM occurred previously
+        try:
+            frames = frames.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            keyframe_indices = keyframe_indices.to(device)
 
-        optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
 
-        with torch.amp.autocast("cuda",enabled=use_amp):
-            logits, features = model(frames, keyframe_indices, return_features=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, features = model(frames, keyframe_indices, return_features=True)
 
-            # Add recovery from training errors
-            try:
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, features = model(
-                        frames, keyframe_indices, return_features=True
+                cls_loss = cls_criterion(logits, labels)
+
+                batch_size, num_frames = frames.shape[0], frames.shape[1]
+                if aux_requires_labels and loss_type == "triplet_standard":
+                    frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
+                    aux_loss = aux_criterion(features["frame_features"], frame_labels)
+                elif aux_requires_labels:
+                    frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
+                    aux_loss = aux_criterion(
+                        features["frame_features"],
+                        features["keyframe_center"],
+                        frame_labels,
+                        labels,
                     )
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    # Skip this batch
-                    logger.warning("OOM detected, skipping batch")
-                    optimizer.zero_grad()
-                    continue
+                else:
+                    aux_loss = aux_criterion(
+                        features["frame_features"], features["keyframe_center"]
+                    )
+
+                loss = cls_loss + alpha * aux_loss
+
+            scaler.scale(loss).backward()
+
+            # Gradient clipping to prevent exploding gradients
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Statistics
+            total_loss += loss.item()
+            total_cls_loss += cls_loss.item()
+            total_aux_loss += aux_loss.item()
+
+            _, predicted = logits.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+            # Update progress bar
+            pbar.set_postfix(
+                {"loss": f"{loss.item():.4f}", "acc": f"{100. * correct / total:.2f}%"}
+            )
+
+            # Clear cache more frequently
+            if torch.cuda.is_available() and (batch_idx + 1) % 5 == 0:
+                torch.cuda.empty_cache()
+
+            # Delete intermediate variables
+            del (
+                frames,
+                labels,
+                keyframe_indices,
+                logits,
+                features,
+                loss,
+                cls_loss,
+                aux_loss,
+            )
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\n OOM at batch {batch_idx}, skipping...")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            else:
                 raise e
-
-            cls_loss = cls_criterion(logits, labels)
-
-            batch_size, num_frames = frames.shape[0], frames.shape[1]
-            if aux_requires_labels and loss_type == "triplet_standard":
-                frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
-                aux_loss = aux_criterion(features["frame_features"], frame_labels)
-            elif aux_requires_labels:  # triplet_coherence
-                frame_labels = labels.unsqueeze(1).expand(-1, num_frames)
-                aux_loss = aux_criterion(
-                    features["frame_features"],
-                    features["keyframe_center"],
-                    frame_labels,
-                    labels,
-                )
-            else:  # coherence
-                aux_loss = aux_criterion(
-                    features["frame_features"], features["keyframe_center"]
-                )
-
-            loss = cls_loss + alpha * aux_loss
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        # Statistics
-        total_loss += loss.item()
-        total_cls_loss += cls_loss.item()
-        total_aux_loss += aux_loss.item()
-
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-        # Update progress bar
-        pbar.set_postfix(
-            {"loss": f"{loss.item():.4f}", "acc": f"{100. * correct / total:.2f}%"}
-        )
-
-        # Clear cache periodically
-        if torch.cuda.is_available() and (batch_idx + 1) % 10 == 0:
-            torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(train_loader)
     avg_cls_loss = total_cls_loss / len(train_loader)
@@ -902,7 +948,9 @@ def train_kga_net(
 
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}_{loss_type}.pth")
+            checkpoint_path = os.path.join(
+                save_dir, f"checkpoint_epoch_{epoch+1}_{loss_type}.pth"
+            )
             torch.save(
                 {
                     "epoch": epoch,
@@ -937,9 +985,9 @@ if __name__ == "__main__":
 
     # Training configuration
     NUM_EPOCHS = 50
-    BATCH_SIZE = 4
-    NUM_FRAMES = 64  # Match the number of frames in vid_train_frames
-    LEARNING_RATE = 0.0001
+    BATCH_SIZE = 6  # 4
+    NUM_FRAMES = 32  # Match the number of frames in vid_train_frames
+    LEARNING_RATE = 0.0005
 
     # Loss configuration
     # Options: 'coherence', 'triplet_coherence', 'triplet_standard'
@@ -979,7 +1027,8 @@ if __name__ == "__main__":
         print("  └── imagenet_vid_val.json")
     else:
         # Start training
-        for loss_type in ["coherence", "triplet_coherence", "triplet_standard"]:
+        # for loss_type in ["coherence", "triplet_coherence", "triplet_standard"]:
+        for loss_type in ["triplet_coherence", "triplet_standard"]:
             print(f"\nStarting training with loss type: {loss_type}")
             trained_model = train_kga_net(
                 root_dir=ROOT_DIR,
@@ -1008,11 +1057,11 @@ if __name__ == "__main__":
             # Load best model
             checkpoint_path = os.path.join(SAVE_DIR, f"best_model_{loss_type}.pth")
             if os.path.exists(checkpoint_path):
-                checkpoint = torch.load(checkpoint_path)
-                trained_model.load_state_dict(checkpoint["model_state_dict"])
-                print(f"✓ Loaded best model from epoch {checkpoint['epoch']+1}")
-                print(f"  Training Accuracy: {checkpoint['train_acc']:.2f}%")
-                print(f"  Validation Accuracy: {checkpoint['val_acc']:.2f}%")
+                checkpoint_model = torch.load(checkpoint_path)
+                trained_model.load_state_dict(checkpoint_model["model_state_dict"])
+                print(f"✓ Loaded best model from epoch {checkpoint_model['epoch']+1}")
+                print(f"  Training Accuracy: {checkpoint_model['train_acc']:.2f}%")
+                print(f"  Validation Accuracy: {checkpoint_model['val_acc']:.2f}%")
 
                 # Test on validation set
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

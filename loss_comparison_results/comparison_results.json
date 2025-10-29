@@ -1,0 +1,74 @@
+{
+    "Coherence": {
+        "accuracy": 70.27027027027027,
+        "roc_auc": 0.7051282051282051,
+        "avg_precision": 0.8010493711918036,
+        "f1_score": 0.7555555555555555,
+        "sensitivity": 0.7083333333333334,
+        "specificity": 0.6923076923076923,
+        "class_accuracies": {
+            "Benign": 69.23076923076923,
+            "Malignant": 70.83333333333334
+        },
+        "confusion_matrix": [
+            [
+                9,
+                4
+            ],
+            [
+                7,
+                17
+            ]
+        ],
+        "checkpoint_epoch": "6",
+        "description": "Basic MSE-based coherence loss"
+    },
+    "Triplet Coherence": {
+        "accuracy": 70.27027027027027,
+        "roc_auc": 0.5801282051282051,
+        "avg_precision": 0.709167805983587,
+        "f1_score": 0.8135593220338984,
+        "sensitivity": 1.0,
+        "specificity": 0.15384615384615385,
+        "class_accuracies": {
+            "Benign": 15.384615384615385,
+            "Malignant": 100.0
+        },
+        "confusion_matrix": [
+            [
+                2,
+                11
+            ],
+            [
+                0,
+                24
+            ]
+        ],
+        "checkpoint_epoch": "13",
+        "description": "Keyframe-guided triplet loss"
+    },
+    "Standard Triplet": {
+        "accuracy": 64.86486486486487,
+        "roc_auc": 0.391025641025641,
+        "avg_precision": 0.6295831404191976,
+        "f1_score": 0.7868852459016393,
+        "sensitivity": 1.0,
+        "specificity": 0.0,
+        "class_accuracies": {
+            "Benign": 0.0,
+            "Malignant": 100.0
+        },
+        "confusion_matrix": [
+            [
+                0,
+                13
+            ],
+            [
+                0,
+                24
+            ]
+        ],
+        "checkpoint_epoch": "0",
+        "description": "Standard triplet loss with hard mining"
+    }
+}
