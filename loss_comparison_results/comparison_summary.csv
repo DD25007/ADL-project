@@ -1,4 +1,0 @@
-Loss Function,Accuracy (%),Benign Acc (%),Malignant Acc (%),ROC AUC,Avg Precision,F1 Score,Sensitivity,Specificity,True Positives,True Negatives,False Positives,False Negatives,Total Errors,Checkpoint Epoch
-Coherence,70.27,69.23,70.83,0.7051,0.8010,0.7556,0.7083,0.6923,17,9,4,7,11,6
-Triplet Coherence,70.27,15.38,100.00,0.5801,0.7092,0.8136,1.0000,0.1538,24,2,11,0,11,13
-Standard Triplet,64.86,0.00,100.00,0.3910,0.6296,0.7869,1.0000,0.0000,24,0,13,0,13,0

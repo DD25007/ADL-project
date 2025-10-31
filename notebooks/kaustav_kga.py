@@ -24,6 +24,60 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
+class BUSIImageDataset(Dataset):
+    """Dataset for BUSI ultrasound images with COCO annotations."""
+
+    def __init__(self, root_dir, annotation_file, transform=None):
+        self.root_dir = root_dir
+
+        with open(annotation_file, "r") as f:
+            self.coco_data = json.load(f)
+
+        self.images = {img["id"]: img for img in self.coco_data["images"]}
+        self.image_ids = list(self.images.keys())
+
+        # Get labels from annotations
+        self.image_labels = {}
+        for ann in self.coco_data["annotations"]:
+            img_id = ann["image_id"]
+            if img_id not in self.image_labels:
+                self.image_labels[img_id] = ann["category_id"] - 1  # 0-indexed
+
+        self.transform = (
+            transform
+            if transform
+            else transforms.Compose(
+                [
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    ),
+                ]
+            )
+        )
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        image_info = self.images[image_id]
+        image_path = os.path.join(self.root_dir, image_info["file_name"])
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except:
+            image = Image.new("RGB", (224, 224), (0, 0, 0))
+
+        label = self.image_labels.get(image_id, 0)
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
 class UltrasoundVideoDataset(Dataset):
     """
     Dataset class for loading ultrasound videos stored as individual frames.
@@ -52,7 +106,6 @@ class UltrasoundVideoDataset(Dataset):
 
         # Parse categories
         self.categories = {cat["id"]: cat["name"] for cat in data["categories"]}
-        self.category_to_id = {cat["name"]: cat["id"] for cat in data["categories"]}
 
         # Parse videos
         self.videos = data["videos"]
@@ -209,7 +262,7 @@ class UltrasoundVideoDataset(Dataset):
         return frames, label, keyframe_indices
 
 
-def create_dataloaders(
+def video_dataloader(
     root_dir,
     train_annotation="imagenet_vid_train_15frames.json",
     val_annotation="imagenet_vid_val.json",
@@ -388,6 +441,27 @@ class TemporalAggregation(nn.Module):
 # ============================================================================
 # LOSS FUNCTIONS
 # ============================================================================
+
+
+class CenterLoss(nn.Module):
+    """Center Loss for discriminative feature learning.
+    Args:
+        num_classes: Number of classes
+        feature_dim: Dimension of feature vectors
+        device: Device to store the centers
+    """
+
+    def __init__(self, num_classes, feature_dim, device="cuda"):
+        super(CenterLoss, self).__init__()
+        self.num_classes = num_classes
+        self.feature_dim = feature_dim
+        self.centers = nn.Parameter(torch.randn(num_classes, feature_dim).to(device))
+
+    def forward(self, features, labels):
+        batch_size = features.size(0)
+        centers_batch = self.centers[labels]
+        loss = torch.sum((features - centers_batch) ** 2) / (2.0 * batch_size)
+        return loss
 
 
 class CoherenceLoss(nn.Module):
@@ -570,6 +644,9 @@ class StandardTripletLoss(nn.Module):
 
 class KGANet(nn.Module):
     """KGA-Net: Keyframe Guidance Attention Network.
+
+    The last 2 layers (avgpool and fc) of ResNet-50 are removed to obtain feature maps. This helps in
+    preserving spatial information for the KGA module.
     Args:
         num_classes: Number of output classes
         feature_dim: Dimension of feature maps from backbone
@@ -586,18 +663,26 @@ class KGANet(nn.Module):
         reduction=16,
         aggregation_type="attention",
         pretrained=True,
+        backbone=None,
         use_gradient_checkpointing=True,
     ):
         super(KGANet, self).__init__()
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
-        if pretrained:
-            weights = ResNet50_Weights.IMAGENET1K_V1
+        # Use provided backbone if available (shared). Backbone should give spatial features (B, C, H, W)
+        if backbone is not None:
+            self.backbone = backbone
+            self._owns_backbone = False
         else:
-            weights = None
-
-        resnet = resnet50(weights=weights)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+            if pretrained:
+                weights = ResNet50_Weights.IMAGENET1K_V2
+            else:
+                weights = None
+            resnet = resnet50(weights=weights)
+            self.backbone = nn.Sequential(
+                *list(resnet.children())[:-2]
+            )  # Remove avgpool and fc
+            self._owns_backbone = True
 
         self.kfc = KeyframeFeatureCenter(feature_dim)
         self.kga = KeyframeGuidanceAttention(feature_dim, reduction)
@@ -619,7 +704,7 @@ class KGANet(nn.Module):
         frames_flat = video_frames.view(
             batch_size * num_frames, rgb_channels, height, width
         )
-        features_flat = self.backbone(frames_flat)
+        features_flat = self.backbone(frames_flat)  # (B*N, C, Hf, Wf)
         _, feat_channels, feat_height, feat_width = features_flat.shape
         frame_features = features_flat.view(
             batch_size, num_frames, feat_channels, feat_height, feat_width
@@ -628,8 +713,7 @@ class KGANet(nn.Module):
         if keyframe_indices is None:
             keyframe_features = frame_features[:, 0:1, :, :, :]
         else:
-            # keyframe_indices: (batch, k)
-            # Use torch.gather to avoid Python loop. Build index tensor of shape (batch, k, C, H, W)
+            # gather keyframe features
             k = keyframe_indices.shape[1]
             idx = keyframe_indices.view(batch_size, k, 1, 1, 1).expand(
                 -1, -1, feat_channels, feat_height, feat_width
@@ -654,12 +738,47 @@ class KGANet(nn.Module):
 
         return logits
 
-    # Add parameter groups for different learning rates
-    def get_parameter_groups(self):
-        return [
-            {"params": self.backbone.parameters(), "lr_mult": 0.1},
-            {"params": self.classifier.parameters(), "lr_mult": 1.0},
-        ]
+
+class ImageClassificationNetwork(nn.Module):
+    """Image classification network that can share the same 2D backbone as KGANet."""
+
+    def __init__(self, num_classes=2, feature_dim=512, pretrained=True, backbone=None):
+        super(ImageClassificationNetwork, self).__init__()
+
+        # If backbone is provided it should be the same conv stack as KGANet (children()[:-2])
+        if backbone is not None:
+            self.backbone = backbone
+            self._owns_backbone = False
+        else:
+            if pretrained:
+                weights = ResNet50_Weights.IMAGENET1K_V2
+            else:
+                weights = None
+            resnet = resnet50(weights=weights)
+            # keep convs only, not avgpool/fc
+            self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+            self._owns_backbone = True
+
+        # For image classification we pool the spatial feature map to a vector
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # convert 2048 -> feature_dim
+        self.feature_layer = nn.Sequential(
+            nn.Linear(2048, feature_dim), nn.ReLU(), nn.Dropout(0.3)
+        )
+
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, images, return_features=False):
+        # images: (B, 3, H, W) -> backbone -> (B, 2048, Hf, Wf)
+        feats = self.backbone(images)
+        pooled = self.global_pool(feats).view(feats.size(0), -1)  # (B, 2048)
+        features = self.feature_layer(pooled)  # (B, feature_dim)
+        logits = self.classifier(features)
+
+        if return_features:
+            return logits, features
+        return logits
 
 
 # ============================================================================
@@ -667,10 +786,211 @@ class KGANet(nn.Module):
 # ============================================================================
 
 
-def train_one_epoch(
-    model, train_loader, optimizer, device, loss_type="triplet_standard", alpha=0.5
+def train_joint_epoch(
+    image_model,
+    video_model,
+    image_loader,
+    video_loader,
+    image_optimizer,
+    video_optimizer,
+    center_optimizer,
+    device,
+    center_loss_fn,
+    alpha_center=0.5,
+    alpha_video=0.5,
+    video_loss_type="triplet_standard",
+    mining="hard",
 ):
-    """Train for one epoch."""
+    """Train both image and video models jointly for one epoch.
+    Args:
+        image_model: Image classification model
+        video_model: Video classification model
+        image_loader: DataLoader for image data
+        video_loader: DataLoader for video data
+        image_optimizer: Optimizer for image model
+        video_optimizer: Optimizer for video model
+        center_optimizer: Optimizer for center loss parameters
+        device: Device to run training on
+        center_loss_fn: Center loss function
+        alpha_center: Weight for center loss
+        alpha_video: Weight for video auxiliary loss
+        video_loss_type: Type of auxiliary loss for video model
+        mining: Mining strategy for triplet loss
+    Returns:
+        tuple:
+        - avg_image_loss: Average loss for image model
+        - avg_video_loss: Average loss for video model
+        - image_accuracy: Accuracy for image model
+        - video_accuracy: Accuracy for video model
+    """
+
+    image_model.train()
+    video_model.train()
+
+    # Loss tracking
+    total_image_loss = 0.0
+    total_video_loss = 0.0
+    image_correct = 0
+    video_correct = 0
+    image_total = 0
+    video_total = 0
+
+    cls_criterion = nn.CrossEntropyLoss()
+
+    # Video auxiliary loss
+    if video_loss_type == "coherence":
+        video_aux_criterion = CoherenceLoss()
+        aux_requires_labels = False
+    elif video_loss_type == "triplet_coherence":
+        video_aux_criterion = TripletCoherenceLoss(margin=1.0)
+        aux_requires_labels = True
+    else:
+        video_aux_criterion = StandardTripletLoss(margin=1.0, mining=mining)
+        aux_requires_labels = True
+
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # Iterate through both loaders
+    image_iter = iter(image_loader)
+    video_iter = iter(video_loader)
+
+    max_iters = max(len(image_loader), len(video_loader))
+    pbar = tqdm(range(max_iters), desc="Joint Training")
+
+    for batch_idx in pbar:
+        # ==================== IMAGE BATCH ====================
+        try:
+            images, img_labels = next(image_iter)
+        except StopIteration:
+            image_iter = iter(image_loader)
+            images, img_labels = next(image_iter)
+
+        images = images.to(device, non_blocking=True)
+        img_labels = img_labels.to(device, non_blocking=True)
+
+        image_optimizer.zero_grad(set_to_none=True)
+        center_optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            img_logits, img_features = image_model(images, return_features=True)
+            img_cls_loss = cls_criterion(img_logits, img_labels)
+            img_center_loss = center_loss_fn(img_features, img_labels)
+            img_loss = img_cls_loss + alpha_center * img_center_loss
+
+        scaler.scale(img_loss).backward()
+        scaler.unscale_(image_optimizer)
+        torch.nn.utils.clip_grad_norm_(image_model.parameters(), max_norm=1.0)
+        scaler.step(image_optimizer)
+
+        # Update centers
+        for param in center_loss_fn.parameters():
+            if param.grad is not None:
+                param.grad.data *= 1.0 / alpha_center
+        scaler.step(center_optimizer)
+        scaler.update()
+
+        total_image_loss += img_loss.item()
+        _, img_pred = img_logits.max(1)
+        image_total += img_labels.size(0)
+        image_correct += img_pred.eq(img_labels).sum().item()
+
+        # ==================== VIDEO BATCH ====================
+        try:
+            frames, vid_labels, keyframe_indices = next(video_iter)
+        except StopIteration:
+            video_iter = iter(video_loader)
+            frames, vid_labels, keyframe_indices = next(video_iter)
+
+        frames = frames.to(device, non_blocking=True)
+        vid_labels = vid_labels.to(device, non_blocking=True)
+        keyframe_indices = keyframe_indices.to(device)
+
+        video_optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            vid_logits, vid_features = video_model(
+                frames, keyframe_indices, return_features=True
+            )
+            vid_cls_loss = cls_criterion(vid_logits, vid_labels)
+
+            # Auxiliary loss
+            batch_size, num_frames = frames.shape[0], frames.shape[1]
+            if aux_requires_labels and video_loss_type == "triplet_standard":
+                frame_labels = vid_labels.unsqueeze(1).expand(-1, num_frames)
+                vid_aux_loss = video_aux_criterion(
+                    vid_features["frame_features"], frame_labels
+                )
+            elif aux_requires_labels:
+                frame_labels = vid_labels.unsqueeze(1).expand(-1, num_frames)
+                vid_aux_loss = video_aux_criterion(
+                    vid_features["frame_features"],
+                    vid_features["keyframe_center"],
+                    frame_labels,
+                    vid_labels,
+                )
+            else:
+                vid_aux_loss = video_aux_criterion(
+                    vid_features["frame_features"], vid_features["keyframe_center"]
+                )
+
+            vid_loss = vid_cls_loss + alpha_video * vid_aux_loss
+
+        scaler.scale(vid_loss).backward()
+        scaler.unscale_(video_optimizer)
+        torch.nn.utils.clip_grad_norm_(video_model.parameters(), max_norm=1.0)
+        scaler.step(video_optimizer)
+        scaler.update()
+
+        total_video_loss += vid_loss.item()
+        _, vid_pred = vid_logits.max(1)
+        video_total += vid_labels.size(0)
+        video_correct += vid_pred.eq(vid_labels).sum().item()
+
+        # Update progress
+        pbar.set_postfix(
+            {
+                "img_acc": f"{100.*image_correct/image_total:.1f}%",
+                "vid_acc": f"{100.*video_correct/video_total:.1f}%",
+            }
+        )
+
+        del images, img_labels, frames, vid_labels, keyframe_indices
+
+    return (
+        total_image_loss / len(image_loader),
+        total_video_loss / len(video_loader),
+        100.0 * image_correct / image_total,
+        100.0 * video_correct / video_total,
+    )
+
+
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    device,
+    loss_type="triplet_standard",
+    alpha=0.5,
+    mining="hard",
+):
+    """Train for one epoch.
+    Args:
+        model: KGANet model
+        train_loader: DataLoader for training data
+        optimizer: Optimizer
+        device: Device to run on
+        loss_type: 'coherence', 'triplet_coherence', or 'triplet_standard'
+        alpha: Weight for auxiliary loss
+        mining: Mining strategy for triplet loss ('hard', 'semi-hard', 'all')
+
+    Returns:
+        tuple:
+        - avg_loss: Average total loss
+        - avg_cls_loss: Average classification loss
+        - avg_aux_loss: Average auxiliary loss
+        - accuracy: Training accuracy
+    """
     model.train()
 
     total_loss = 0.0
@@ -687,7 +1007,7 @@ def train_one_epoch(
         aux_criterion = TripletCoherenceLoss(margin=1.0)
         aux_requires_labels = True
     else:
-        aux_criterion = StandardTripletLoss(margin=1.0, mining="hard")
+        aux_criterion = StandardTripletLoss(margin=1.0, mining=mining)
         aux_requires_labels = True
 
     use_amp = device == "cuda" and torch.cuda.is_available()
@@ -826,6 +1146,259 @@ def validate(model, val_loader, device):
     return avg_loss, accuracy
 
 
+def train_joint_kga_net(
+    image_root_dir,
+    image_annotation_file,
+    video_root_dir,
+    video_train_annotation,
+    video_val_annotation,
+    # Training params
+    num_epochs=50,
+    image_batch_size=32,
+    video_batch_size=4,
+    num_frames=32,
+    image_lr=0.001,
+    video_lr=0.0001,
+    alpha_center=0.5,
+    alpha_video=0.5,
+    feature_dim=512,
+    video_loss_type="triplet_standard",
+    mining="hard",
+    train_split=0.8,
+    save_dir="checkpoints/joint_model",
+    num_workers=4,
+):
+    """
+    Train image and video models jointly.
+
+    Args:
+        image_root_dir: Root directory for image dataset
+        image_annotation_file: Annotation file for image dataset
+        video_root_dir: Root directory for video dataset
+        video_train_annotation: Training annotation file for video dataset
+        video_val_annotation: Validation annotation file for video dataset
+        num_epochs: Number of training epochs
+        image_batch_size: Batch size for image model
+        video_batch_size: Batch size for video model
+        num_frames: Number of frames per video
+        image_lr: Learning rate for image model
+        video_lr: Learning rate for video model
+        alpha_center: Weight for center loss
+        alpha_video: Weight for video auxiliary loss
+        feature_dim: Feature dimension for image model
+        video_loss_type: Type of auxiliary loss for video model
+        mining: Mining strategy for triplet loss ('hard', 'semi-hard', 'all')
+        train_split: Train/validation split ratio for image dataset
+        save_dir: Directory to save checkpoints
+        num_workers: Number of DataLoader workers
+
+    Returns:
+        tuple:
+        - image_model: Trained image classification model
+        - video_model: Trained video classification model
+
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    # ==================== CREATE IMAGE DATALOADERS ====================
+    logger.info("\nLoading image dataset...")
+
+    train_img_transform = transforms.Compose(
+        [
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop((224, 224)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    val_img_transform = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    full_image_dataset = BUSIImageDataset(image_root_dir, image_annotation_file)
+    total_size = len(full_image_dataset)
+    train_size = int(total_size * train_split)
+    val_size = total_size - train_size
+
+    torch.manual_seed(42)
+    train_indices, val_indices = torch.utils.data.random_split(
+        range(total_size), [train_size, val_size]
+    )
+
+    train_image_dataset = BUSIImageDataset(
+        image_root_dir, image_annotation_file, train_img_transform
+    )
+    train_image_dataset = torch.utils.data.Subset(
+        train_image_dataset, train_indices.indices
+    )
+
+    val_image_dataset = BUSIImageDataset(
+        image_root_dir, image_annotation_file, val_img_transform
+    )
+    val_image_dataset = torch.utils.data.Subset(val_image_dataset, val_indices.indices)
+
+    image_train_loader = DataLoader(
+        train_image_dataset,
+        batch_size=image_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    image_val_loader = DataLoader(
+        val_image_dataset,
+        batch_size=image_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    logger.info(f"Image training samples: {len(train_image_dataset)}")
+    logger.info(f"Image validation samples: {len(val_image_dataset)}")
+
+    # ==================== CREATE VIDEO DATALOADERS ====================
+    logger.info("\nLoading video dataset...")
+    video_train_loader, video_val_loader = video_dataloader(
+        root_dir=video_root_dir,
+        train_annotation=video_train_annotation,
+        val_annotation=video_val_annotation,
+        batch_size=video_batch_size,
+        num_frames=num_frames,
+        num_workers=num_workers,
+    )
+
+    # ==================== CREATE MODELS ====================
+    logger.info("\nInitializing models...")
+
+    image_model = ImageClassificationNetwork(
+        num_classes=2, feature_dim=feature_dim, pretrained=True
+    ).to(device)
+
+    video_model = KGANet(
+        num_classes=2,
+        feature_dim=2048,
+        reduction=16,
+        aggregation_type="attention",
+        pretrained=True,
+    ).to(device)
+
+    center_loss_fn = CenterLoss(num_classes=2, feature_dim=feature_dim, device=device)
+
+    # ==================== OPTIMIZERS ====================
+    image_optimizer = torch.optim.Adam(
+        image_model.parameters(), lr=image_lr, weight_decay=1e-4
+    )
+    video_optimizer = torch.optim.Adam(
+        video_model.parameters(), lr=video_lr, weight_decay=1e-4
+    )
+    center_optimizer = torch.optim.SGD(center_loss_fn.parameters(), lr=0.5)
+
+    image_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        image_optimizer, mode="max", factor=0.5, patience=5
+    )
+    video_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        video_optimizer, mode="max", factor=0.5, patience=5
+    )
+
+    # ==================== TRAINING LOOP ====================
+    logger.info(f"\nStarting joint training for {num_epochs} epochs...")
+    logger.info("=" * 70)
+
+    best_img_acc = 0.0
+    best_vid_acc = 0.0
+
+    for epoch in range(num_epochs):
+        logger.info(f"\nEpoch {epoch+1}/{num_epochs}")
+        logger.info("-" * 70)
+
+        # Train
+        img_loss, vid_loss, img_acc, vid_acc = train_joint_epoch(
+            image_model,
+            video_model,
+            image_train_loader,
+            video_train_loader,
+            image_optimizer,
+            video_optimizer,
+            center_optimizer,
+            device,
+            center_loss_fn,
+            alpha_center,
+            alpha_video,
+            video_loss_type,
+            mining,
+        )
+
+        logger.info(f"Train - Image Loss: {img_loss:.4f}, Acc: {img_acc:.2f}%")
+        logger.info(f"Train - Video Loss: {vid_loss:.4f}, Acc: {vid_acc:.2f}%")
+
+        # Validate image model
+        image_model.eval()
+        val_img_loss, val_img_acc = 0.0, 0.0
+        img_correct, img_total = 0, 0
+        with torch.no_grad():
+            for images, labels in image_val_loader:
+                images, labels = images.to(device), labels.to(device)
+                logits = image_model(images)
+                _, pred = logits.max(1)
+                img_total += labels.size(0)
+                img_correct += pred.eq(labels).sum().item()
+        val_img_acc = 100.0 * img_correct / img_total
+
+        # Validate video model
+        val_vid_loss, val_vid_acc = validate(video_model, video_val_loader, device)
+
+        logger.info(f"Val   - Image Acc: {val_img_acc:.2f}%")
+        logger.info(f"Val   - Video Loss: {val_vid_loss:.4f}, Acc: {val_vid_acc:.2f}%")
+
+        # Schedulers
+        image_scheduler.step(val_img_acc)
+        video_scheduler.step(val_vid_acc)
+
+        # Save best models
+        if val_img_acc > best_img_acc:
+            best_img_acc = val_img_acc
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": image_model.state_dict(),
+                    "center_loss_state_dict": center_loss_fn.state_dict(),
+                    "val_acc": val_img_acc,
+                },
+                os.path.join(save_dir, "best_image_model.pth"),
+            )
+            logger.info(f"✓ Saved best image model (Acc: {val_img_acc:.2f}%)")
+
+        if val_vid_acc > best_vid_acc:
+            best_vid_acc = val_vid_acc
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": video_model.state_dict(),
+                    "val_acc": val_vid_acc,
+                },
+                os.path.join(save_dir, "best_video_model.pth"),
+            )
+            logger.info(f"✓ Saved best video model (Acc: {val_vid_acc:.2f}%)")
+
+    logger.info("\n" + "=" * 70)
+    logger.info(f"Training completed!")
+    logger.info(f"Best Image Acc: {best_img_acc:.2f}%")
+    logger.info(f"Best Video Acc: {best_vid_acc:.2f}%")
+    logger.info("=" * 70)
+
+    return image_model, video_model
+
+
 def train_kga_net(
     root_dir,
     train_annotation="imagenet_vid_train_15frames.json",
@@ -835,6 +1408,7 @@ def train_kga_net(
     num_frames=15,
     learning_rate=0.0001,
     loss_type="triplet_standard",
+    mining="hard",
     alpha=0.5,
     save_dir="checkpoints",
 ):
@@ -863,7 +1437,7 @@ def train_kga_net(
 
     # Create dataloaders
     print("\nLoading dataset...")
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader = video_dataloader(
         root_dir=root_dir,
         train_annotation=train_annotation,
         val_annotation=val_annotation,
@@ -910,7 +1484,7 @@ def train_kga_net(
 
         # Train
         train_loss, train_cls_loss, train_aux_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, device, loss_type, alpha
+            model, train_loader, optimizer, device, loss_type, alpha, mining=mining
         )
 
         print(
@@ -933,7 +1507,12 @@ def train_kga_net(
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            checkpoint_path = os.path.join(save_dir, f"best_model_{loss_type}.pth")
+            if loss_type == "triplet_standard":
+                checkpoint_path = os.path.join(
+                    save_dir, f"best_model_{loss_type}_{mining}.pth"
+                )
+            else:
+                checkpoint_path = os.path.join(save_dir, f"best_model_{loss_type}.pth")
             torch.save(
                 {
                     "epoch": epoch,
@@ -948,9 +1527,14 @@ def train_kga_net(
 
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(
-                save_dir, f"checkpoint_epoch_{epoch+1}_{loss_type}.pth"
-            )
+            if loss_type == "triplet_standard":
+                checkpoint_path = os.path.join(
+                    save_dir, f"checkpoint_epoch_{epoch+1}_{loss_type}_{mining}.pth"
+                )
+            else:
+                checkpoint_path = os.path.join(
+                    save_dir, f"checkpoint_epoch_{epoch+1}_{loss_type}.pth"
+                )
             torch.save(
                 {
                     "epoch": epoch,
@@ -985,13 +1569,14 @@ if __name__ == "__main__":
 
     # Training configuration
     NUM_EPOCHS = 50
-    BATCH_SIZE = 6  # 4
+    BATCH_SIZE = 4
     NUM_FRAMES = 32  # Match the number of frames in vid_train_frames
     LEARNING_RATE = 0.0005
 
     # Loss configuration
     # Options: 'coherence', 'triplet_coherence', 'triplet_standard'
-    LOSS_TYPE = "triplet_standard"
+    # LOSS_TYPE = "triplet_standard"
+    # MINING = "hard"  # 'hard', 'semi-hard', or 'all' (only for triplet_standard)
     ALPHA = 0.5  # Weight for auxiliary loss
 
     # Save configuration
@@ -1000,36 +1585,38 @@ if __name__ == "__main__":
     # ========================================================================
     # Start Training
     # ========================================================================
-
     print("=" * 70)
     print("KGA-Net Training Pipeline")
     print("=" * 70)
-    print(f"Dataset Root: {ROOT_DIR}")
-    print(f"Loss Type: {LOSS_TYPE}")
-    print(f"Batch Size: {BATCH_SIZE}")
-    print(f"Number of Frames: {NUM_FRAMES}")
-    print(f"Learning Rate: {LEARNING_RATE}")
-    print(f"Alpha (Auxiliary Loss Weight): {ALPHA}")
-    print(f"Number of Epochs: {NUM_EPOCHS}")
-    print("=" * 70)
-
     # Check if dataset exists
     if not os.path.exists(ROOT_DIR):
         print(f"\n❌ Error: Dataset directory not found: {ROOT_DIR}")
         print("\nPlease update ROOT_DIR to point to your dataset location.")
-        print("Expected structure:")
-        print("  data_Amss007_ultrasound_dat/")
-        print("  ├── rawframes/")
-        print("  │   ├── benign/")
-        print("  │   │   └── x28f299ceb056964c/")
-        print("  │   └── malignant/")
-        print("  ├── imagenet_vid_train_15frames.json")
-        print("  └── imagenet_vid_val.json")
     else:
         # Start training
-        # for loss_type in ["coherence", "triplet_coherence", "triplet_standard"]:
-        for loss_type in ["triplet_coherence", "triplet_standard"]:
-            print(f"\nStarting training with loss type: {loss_type}")
+        for LOSS_TYPE, MINING in [
+            ("coherence", None),
+            ("triplet_coherence", None),
+            ("triplet_standard", "hard"),
+            ("triplet_standard", "semi-hard"),
+            ("triplet_standard", "all"),
+        ]:
+            print(f"Dataset Root: {ROOT_DIR}")
+            print(f"Loss Type: {LOSS_TYPE}")
+            print(f"Batch Size: {BATCH_SIZE}")
+            print(f"Number of Frames: {NUM_FRAMES}")
+            print(f"Learning Rate: {LEARNING_RATE}")
+            print(f"Alpha (Auxiliary Loss Weight): {ALPHA}")
+            print(f"Number of Epochs: {NUM_EPOCHS}")
+
+            if LOSS_TYPE != "triplet_standard":
+                print(f"\nStarting training with loss type: {LOSS_TYPE}")
+            else:
+                print(
+                    f"\nStarting training with loss type: {LOSS_TYPE}, mining: {MINING}"
+                )
+            print("=" * 70)
+
             trained_model = train_kga_net(
                 root_dir=ROOT_DIR,
                 train_annotation=TRAIN_ANNOTATION,
@@ -1038,7 +1625,8 @@ if __name__ == "__main__":
                 batch_size=BATCH_SIZE,
                 num_frames=NUM_FRAMES,
                 learning_rate=LEARNING_RATE,
-                loss_type=loss_type,
+                loss_type=LOSS_TYPE,
+                mining=MINING,
                 alpha=ALPHA,
                 save_dir=SAVE_DIR,
             )
@@ -1055,7 +1643,12 @@ if __name__ == "__main__":
             print("=" * 70)
 
             # Load best model
-            checkpoint_path = os.path.join(SAVE_DIR, f"best_model_{loss_type}.pth")
+            if LOSS_TYPE == "triplet_standard":
+                checkpoint_path = os.path.join(
+                    SAVE_DIR, f"best_model_{LOSS_TYPE}_{MINING}.pth"
+                )
+            else:
+                checkpoint_path = os.path.join(SAVE_DIR, f"best_model_{LOSS_TYPE}.pth")
             if os.path.exists(checkpoint_path):
                 checkpoint_model = torch.load(checkpoint_path)
                 trained_model.load_state_dict(checkpoint_model["model_state_dict"])
@@ -1067,7 +1660,7 @@ if __name__ == "__main__":
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 trained_model.eval()
 
-                _, val_loader = create_dataloaders(
+                _, val_loader = video_dataloader(
                     root_dir=ROOT_DIR,
                     train_annotation=TRAIN_ANNOTATION,
                     val_annotation=VAL_ANNOTATION,
