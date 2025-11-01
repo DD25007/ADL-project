@@ -1,0 +1,6 @@
+Model,Accuracy (%),Precision (%),Recall (%),F1-Score (%),AUC,Cohen's κ
+Coherence Loss,62.16,53.68,62.16,53.60,0.622,-0.008
+Triplet-Coherence,51.35,47.19,51.35,48.80,0.457,-0.148
+Hard Mining,62.16,58.30,62.16,58.59,0.526,0.072
+Semi-Hard Mining,56.76,59.87,56.76,57.67,0.599,0.114
+All Mining,45.95,49.25,45.95,47.09,0.420,-0.108
