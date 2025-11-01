@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -801,10 +802,15 @@ def train_joint_epoch(
     center_optimizer,
     device,
     center_loss_fn,
+    image_scheduler,
+    video_scheduler,
+    backbone_scheduler,
     alpha_center=0.5,
     alpha_video=0.5,
     video_loss_type="triplet_standard",
     mining="hard",
+    start_iter=0,
+    max_iters=8000,
 ):
     """Train both image and video models jointly for one epoch.
     Args:
@@ -858,10 +864,15 @@ def train_joint_epoch(
     image_iter = iter(image_loader)
     video_iter = iter(video_loader)
 
-    max_iters = max(len(image_loader), len(video_loader))
-    pbar = tqdm(range(max_iters), desc="Joint Training")
+    # Use min() to process both together (1:1 sampling)
+    max_iters_this_epoch = min(len(image_loader), len(video_loader))
+    pbar = tqdm(range(max_iters_this_epoch), desc=f"Training (Iter {start_iter})")
+
+    iters_done = 0
 
     for _ in pbar:
+        if start_iter + iters_done >= max_iters:
+            break
         # ---------- IMAGE BATCH ----------
         try:
             images, img_labels = next(image_iter)
@@ -970,8 +981,16 @@ def train_joint_epoch(
         video_total += vid_labels.size(0)
         video_correct += vid_pred.eq(vid_labels).sum().item()
 
+        iters_done += 1
+
+        # Step schedulers per iteration
+        image_scheduler.step()
+        video_scheduler.step()
+        backbone_scheduler.step()
+
         pbar.set_postfix(
             {
+                "iter": f"{start_iter + iters_done}/{max_iters}",
                 "img_acc": f"{100.*image_correct/image_total:.1f}%",
                 "vid_acc": f"{100.*video_correct/video_total:.1f}%",
             }
@@ -981,10 +1000,11 @@ def train_joint_epoch(
         del images, img_labels, frames, vid_labels, keyframe_indices
 
     return (
-        total_image_loss / len(image_loader),
-        total_video_loss / len(video_loader),
+        total_image_loss / iters_done,
+        total_video_loss / iters_done,
         100.0 * image_correct / image_total,
         100.0 * video_correct / video_total,
+        iters_done,  # NEW: return iteration count
     )
 
 
@@ -1033,7 +1053,7 @@ def train_joint_kga_net(
     video_train_annotation,
     video_val_annotation,
     # Training params
-    num_epochs=50,
+    total_iter=8000,
     image_batch_size=32,
     video_batch_size=4,
     num_frames=32,
@@ -1057,7 +1077,7 @@ def train_joint_kga_net(
         video_root_dir: Root directory for video dataset
         video_train_annotation: Training annotation file for video dataset
         video_val_annotation: Validation annotation file for video dataset
-        num_epochs: Number of training epochs
+        total_iter: Total number of iterations
         image_batch_size: Batch size for image model
         video_batch_size: Batch size for video model
         num_frames: Number of frames per video
@@ -1185,16 +1205,16 @@ def train_joint_kga_net(
 
     # ---------------- OPTIMIZERS ----------------
     # backbone optimizer (shared)
-    backbone_optimizer = torch.optim.Adam(
-        shared_backbone.parameters(), lr=video_lr, weight_decay=1e-4
+    backbone_optimizer = torch.optim.SGD(
+        shared_backbone.parameters(), lr=video_lr, momentum=0.9, weight_decay=1e-4
     )
 
     # image-specific optimizer: feature_layer + classifier
     image_head_params = list(image_model.feature_layer.parameters()) + list(
         image_model.classifier.parameters()
     )
-    image_head_optimizer = torch.optim.Adam(
-        image_head_params, lr=image_lr, weight_decay=1e-4
+    image_head_optimizer = torch.optim.SGD(
+        image_head_params, lr=image_lr, momentum=0.9, weight_decay=1e-4
     )
 
     # video-specific optimizer: kga, kfc, temporal_agg, classifier
@@ -1204,26 +1224,49 @@ def train_joint_kga_net(
         if "backbone" in name:
             continue
         video_head_params.append(p)
-    video_head_optimizer = torch.optim.Adam(
-        video_head_params, lr=video_lr, weight_decay=1e-4
-    )
+        video_head_optimizer = torch.optim.SGD(
+            video_head_params, lr=video_lr, momentum=0.9, weight_decay=1e-4
+        )
 
     center_optimizer = torch.optim.SGD(center_loss_fn.parameters(), lr=0.5)
 
-    image_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        image_head_optimizer, mode="max", factor=0.5, patience=5
-    )
-    video_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        video_head_optimizer, mode="max", factor=0.5, patience=5
+    # Calculate total iterations (limited by smaller dataset)
+    iterations_per_epoch = min(len(image_train_loader), len(video_train_loader))
+    num_epochs = math.ceil(total_iter / iterations_per_epoch)
+
+    logger.info(f"Iterations per epoch: {iterations_per_epoch}")
+    logger.info(f"Training for {num_epochs} epochs to reach {total_iter} iterations")
+
+    # Iteration-based LR schedule
+    def lr_lambda(current_iter):
+        if current_iter < 1000:  # warmup
+            return float(current_iter) / 1000.0
+        elif current_iter < 4000:
+            return 1.0
+        elif current_iter < 6000:
+            return 0.1
+        else:
+            return 0.01
+
+    image_scheduler = torch.optim.lr_scheduler.LambdaLR(image_head_optimizer, lr_lambda)
+    video_scheduler = torch.optim.lr_scheduler.LambdaLR(video_head_optimizer, lr_lambda)
+    backbone_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        backbone_optimizer, lr_lambda
     )
 
-    logger.info(f"\nStarting joint training for {num_epochs} epochs...")
+    logger.info(f"\nStarting joint training...")
     best_img_acc = 0.0
     best_vid_acc = 0.0
+    global_iter = 0
 
     for epoch in range(num_epochs):
-        logger.info(f"\nEpoch {epoch+1}/{num_epochs}")
-        img_loss, vid_loss, img_acc, vid_acc = train_joint_epoch(
+        if global_iter >= total_iter:
+            break
+
+        logger.info(f"\nEpoch {epoch+1}/{num_epochs} (Iter {global_iter}/{total_iter})")
+
+        # Modified train function to return iteration count
+        img_loss, vid_loss, img_acc, vid_acc, iters_done = train_joint_epoch(
             image_model,
             video_model,
             image_train_loader,
@@ -1234,18 +1277,24 @@ def train_joint_kga_net(
             center_optimizer,
             device,
             center_loss_fn,
+            image_scheduler,
+            video_scheduler,
+            backbone_scheduler,
             alpha_center,
             alpha_video,
             video_loss_type,
             mining,
+            global_iter,
+            TOTAL_ITERATIONS,
         )
+
+        global_iter += iters_done
 
         logger.info(f"Train - Image Loss: {img_loss:.4f}, Acc: {img_acc:.2f}%")
         logger.info(f"Train - Video Loss: {vid_loss:.4f}, Acc: {vid_acc:.2f}%")
 
-        # Validate image model
+        # Validation (same as before)
         image_model.eval()
-        val_img_loss, val_img_acc = 0.0, 0.0
         img_correct, img_total = 0, 0
         with torch.no_grad():
             for images, labels in image_val_loader:
@@ -1256,15 +1305,11 @@ def train_joint_kga_net(
                 img_correct += pred.eq(labels).sum().item()
         val_img_acc = 100.0 * img_correct / img_total
 
-        # Validate video model
         val_vid_loss, val_vid_acc = validate(video_model, video_val_loader, device)
 
-        logger.info(f"Val   - Image Loss: {val_img_loss:.4f}, Acc: {val_img_acc:.2f}%")
-        logger.info(f"Val   - Video Loss: {val_vid_loss:.4f}, Acc: {val_vid_acc:.2f}%")
-
-        # Schedulers
-        image_scheduler.step(val_img_acc)
-        video_scheduler.step(val_vid_acc)
+        logger.info(
+            f"Val   - Image Acc: {val_img_acc:.2f}%, Video Acc: {val_vid_acc:.2f}%"
+        )
 
         # Save image and video model checkpoints after each 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -1349,11 +1394,11 @@ if __name__ == "__main__":
     VIDEO_VAL_ANNOTATION = "imagenet_vid_val.json"
 
     # Training configuration
-    NUM_EPOCHS = 50
-    IMAGE_BATCH_SIZE = 32
-    VIDEO_BATCH_SIZE = 4
-    NUM_FRAMES = 32  # Match the number of frames in vid_train_frames
-    LEARNING_RATE = 0.0005  # 0.001, 5e-3, 7e-4
+    TOTAL_ITERATIONS = 8000
+    IMAGE_BATCH_SIZE = 8
+    VIDEO_BATCH_SIZE = 8
+    NUM_FRAMES = 16  # Match the number of frames in vid_train_frames
+    LEARNING_RATE = 0.001  # 0.001, 5e-3, 7e-4
 
     # Loss configuration
     # Options: 'coherence', 'triplet_coherence', 'triplet_standard'
@@ -1383,7 +1428,7 @@ if __name__ == "__main__":
         print(f"Number of Frames: {NUM_FRAMES}")
         print(f"Learning Rate: {LEARNING_RATE}")
         print(f"Alpha (Auxiliary Loss Weight): {ALPHA}")
-        print(f"Number of Epochs: {NUM_EPOCHS}")
+        print(f"Total Iterations:{TOTAL_ITERATIONS}")
 
         if LOSS_TYPE != "triplet_standard":
             logger.info(f"\nStarting training with loss type: {LOSS_TYPE}")
@@ -1402,7 +1447,7 @@ if __name__ == "__main__":
             video_train_annotation=VIDEO_TRAIN_ANNOTATION,
             video_val_annotation=VIDEO_VAL_ANNOTATION,
             # Config
-            num_epochs=NUM_EPOCHS,
+            total_iter=TOTAL_ITERATIONS,
             video_loss_type=LOSS_TYPE,
             mining=MINING,
             alpha_video=ALPHA,
