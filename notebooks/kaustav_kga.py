@@ -385,7 +385,9 @@ class KeyframeGuidanceAttention(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, frame_features, keyframe_center):
+    def forward(
+        self, frame_features: torch.Tensor, keyframe_center: torch.Tensor
+    ) -> torch.Tensor:
         batch_size, num_frames, channels, height, width = frame_features.shape
 
         keyframe_center_expanded = keyframe_center.unsqueeze(1).expand(
@@ -680,7 +682,6 @@ class KGANet(nn.Module):
         # Use provided backbone if available (shared). Backbone should give spatial features (B, C, H, W)
         if backbone is not None:
             self.backbone = backbone
-            self._owns_backbone = False
         else:
             if pretrained:
                 weights = ResNet50_Weights.IMAGENET1K_V2
@@ -690,7 +691,6 @@ class KGANet(nn.Module):
             self.backbone = nn.Sequential(
                 *list(resnet.children())[:-2]
             )  # Remove avgpool and fc
-            self._owns_backbone = True
 
         self.kfc = KeyframeFeatureCenter(feature_dim)
         self.kga = KeyframeGuidanceAttention(feature_dim, reduction)
@@ -761,7 +761,6 @@ class ImageClassificationNetwork(nn.Module):
         # If backbone is provided it should be the same conv stack as KGANet (children()[:-2])
         if backbone is not None:
             self.backbone = backbone
-            self._owns_backbone = False
         else:
             if pretrained:
                 weights = ResNet50_Weights.IMAGENET1K_V2
@@ -770,7 +769,6 @@ class ImageClassificationNetwork(nn.Module):
             resnet = resnet50(weights=weights)
             # keep convs only, not avgpool/fc
             self.backbone = nn.Sequential(*list(resnet.children())[:-2])
-            self._owns_backbone = True
 
         # For image classification we pool the spatial feature map to a vector
         self.global_pool = nn.AdaptiveAvgPool2d(1)

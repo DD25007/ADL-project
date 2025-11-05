@@ -3,6 +3,8 @@ from datasets import (
     Features,
     Value,
     Image as HfImage,
+    load_dataset,
+    concatenate_datasets,
 )
 from PIL import Image as PilImage
 import numpy as np
@@ -55,6 +57,20 @@ features = Features(
 
 kaggle_dataset = Dataset.from_list(records, features=features)
 
+hf = load_dataset("Amss007/ultrasound_dataset_v3_1", cache_dir="../data")
+
+features = Features(
+    {"image": HfImage(), "conditioning_image": HfImage(), "caption": Value("string")}
+)
+
+# Cast Kaggle dataset
+kaggle_dataset = kaggle_dataset.cast(features, num_proc=4)
+
+hf_dataset = hf["train"]  # flatten to Dataset
+hf_dataset = hf_dataset.cast(features)
+
+merged_dataset = concatenate_datasets([kaggle_dataset, hf_dataset])
+
 # Save the whole merged dataset's only image
 root_dir = "data/busi/"
 
@@ -63,15 +79,15 @@ for label in ["benign", "malignant"]:
     os.makedirs(os.path.join(root_dir, label), exist_ok=True)
 
 # Save every image with global index and same naming convention used in JSON
-for global_idx in range(len(kaggle_dataset)):
-    example = kaggle_dataset[global_idx]  # forces HFImage to decode
+for global_idx in range(len(merged_dataset)):
+    example = merged_dataset[global_idx]  # forces HFImage to decode
     label = "benign" if "benign" in example["caption"].lower() else "malignant"
     image = example["image"]  # PIL Image
     save_name = f"{label}_img_{global_idx:04d}.png"
     save_path = os.path.join(root_dir, label, save_name)
     image.save(save_path)
 
-print(f"Saved {len(kaggle_dataset)} images under {root_dir}")
+print(f"Saved {len(merged_dataset)} images under {root_dir}")
 
 
 def masks_to_coco_json(dataset, output_json="data/busi_bboxes.json"):
@@ -148,4 +164,5 @@ def masks_to_coco_json(dataset, output_json="data/busi_bboxes.json"):
     return coco_dict
 
 
-coco_json = masks_to_coco_json(kaggle_dataset, output_json="data/busi_bboxes.json")
+# run it
+coco_json = masks_to_coco_json(merged_dataset, output_json="data/busi_bboxes.json")
