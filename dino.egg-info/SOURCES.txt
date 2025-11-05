@@ -1,0 +1,6 @@
+README.md
+setup.py
+dino.egg-info/PKG-INFO
+dino.egg-info/SOURCES.txt
+dino.egg-info/dependency_links.txt
+dino.egg-info/top_level.txt

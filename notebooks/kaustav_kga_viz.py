@@ -1340,8 +1340,8 @@ if __name__ == "__main__":
     IMAGE_DATA_ROOT = "./data/busi/"
     IMAGE_ANNOTATION = "data/busi_bboxes.json"
     VIDEO_VAL_ANNOTATION = "imagenet_vid_val.json"
-    BATCH_SIZE = 4
-    NUM_FRAMES = 32
+    BATCH_SIZE = 8
+    NUM_FRAMES = 128
     OUTPUT_DIR = "analysis_plots"
 
     # Import dataset loaders
@@ -1391,7 +1391,7 @@ if __name__ == "__main__":
 
     image_val_loader = DataLoader(
         image_val_dataset,
-        batch_size=BATCH_SIZE * 4,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=4,
         pin_memory=True,

@@ -1,0 +1,8 @@
+              precision    recall  f1-score   support
+
+      Benign       0.87      1.00      0.93        47
+   Malignant       1.00      0.63      0.77        19
+
+    accuracy                           0.89        66
+   macro avg       0.94      0.82      0.85        66
+weighted avg       0.91      0.89      0.89        66
