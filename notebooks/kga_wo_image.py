@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,14 +13,10 @@ import logging
 # set random seed for reproducibility
 torch.manual_seed(42)
 
-# Clear logging file
-if os.path.exists("training.log"):
-    os.remove("training.log")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("training.log"), logging.StreamHandler()],
+    handlers=[logging.FileHandler("training_wo_image.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -367,9 +362,7 @@ class KeyframeFeatureCenter(nn.Module):
 
 
 class KeyframeGuidanceAttention(nn.Module):
-    """
-    Keyframe Guidance Attention (KGA) module
-    Uses keyframe feature center to guide attention on video frames"""
+    """Keyframe Guidance Attention (KGA) module uses keyframe feature center to guide attention on video frames"""
 
     def __init__(self, feature_dim, reduction=16):
         super(KeyframeGuidanceAttention, self).__init__()
@@ -447,28 +440,6 @@ class TemporalAggregation(nn.Module):
 # ============================================================================
 
 
-class CenterLoss(nn.Module):
-    """Center Loss for discriminative feature learning.
-    Args:
-        num_classes: Number of classes
-        feature_dim: Dimension of feature vectors
-        device: Device to store the centers
-    """
-
-    def __init__(self, num_classes, feature_dim, device="cuda"):
-        super(CenterLoss, self).__init__()
-        self.num_classes = num_classes
-        self.feature_dim = feature_dim
-        self.centers = nn.Parameter(torch.randn(num_classes, feature_dim).to(device))
-        # self.centers = nn.Parameter(torch.zeros(num_classes, feature_dim).to(device))
-
-    def forward(self, features, labels):
-        batch_size = features.size(0)
-        centers_batch = self.centers[labels]
-        loss = torch.sum((features - centers_batch) ** 2) / (2.0 * batch_size)
-        return loss
-
-
 class CoherenceLoss(nn.Module):
     """Coherence Loss from the original KGA-Net paper."""
 
@@ -486,16 +457,12 @@ class CoherenceLoss(nn.Module):
 
 
 class StandardTripletLoss(nn.Module):
-    """Standard Triplet Loss with mining strategies.
-    Args:
-        margin: Margin for triplet loss
-        mining: Mining strategy - 'hard', 'semi-hard', or 'all'
-    """
+    """Standard Triplet Loss with mining strategies."""
 
     def __init__(self, margin=1.0, mining="hard"):
         super(StandardTripletLoss, self).__init__()
         self.margin = margin
-        self.mining = mining  # 'hard', 'semi-hard', or 'all'
+        self.mining = mining
 
         if mining == "all":
             import warnings
@@ -505,7 +472,7 @@ class StandardTripletLoss(nn.Module):
                 "Consider using 'hard' or 'semi-hard' mining instead."
             )
 
-    def forward(self, frame_features: torch.Tensor, labels: torch.Tensor):
+    def forward(self, frame_features, labels):
         if len(frame_features.shape) == 5:
             batch_size, num_frames, channels, height, width = frame_features.shape
             frame_features = F.adaptive_avg_pool2d(
@@ -517,7 +484,7 @@ class StandardTripletLoss(nn.Module):
 
         dist_matrix = torch.cdist(frame_features, frame_features, p=2)
 
-        labels_equal = torch.unsqueeze(labels, 0) == torch.unsqueeze(labels, 1)
+        labels_equal = labels.unsqueeze(0) == labels.unsqueeze(1)
         labels_not_equal = ~labels_equal
 
         mask_diag = torch.eye(
@@ -684,217 +651,66 @@ class KGANet(nn.Module):
         return logits
 
 
-class ImageClassificationNetwork(nn.Module):
-    """Image classification network that can share the same 2D backbone as KGANet."""
-
-    def __init__(self, num_classes=2, feature_dim=512, pretrained=True, backbone=None):
-        super(ImageClassificationNetwork, self).__init__()
-
-        # If backbone is provided it should be the same conv stack as KGANet (children()[:-2])
-        if backbone is not None:
-            self.backbone = backbone
-        else:
-            if pretrained:
-                weights = ResNet50_Weights.IMAGENET1K_V2
-            else:
-                weights = None
-            resnet = resnet50(weights=weights)
-            # keep convs only, not avgpool/fc
-            self.backbone = nn.Sequential(*list(resnet.children())[:-2])
-
-        # For image classification we pool the spatial feature map to a vector
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-
-        # convert 2048 -> feature_dim
-        # self.feature_layer = nn.Sequential(
-        #     nn.Linear(2048, feature_dim),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.5),  # Increase from 0.3
-        # )
-
-        """To-DO: Experiment with adding LayerNorm here"""
-        self.feature_layer = nn.Sequential(
-            nn.Linear(2048, feature_dim),
-            nn.LayerNorm(feature_dim),  # Add normalization
-            nn.ReLU(),
-            nn.Dropout(0.5),
-        )
-
-        self.classifier = nn.Linear(feature_dim, num_classes)
-
-    def forward(self, images: torch.Tensor, return_features: bool = False):
-        # images: (Batch_size, 3, Height, Width) -> backbone -> (Batch_size, 2048, feat_H, feat_W)
-        feats = self.backbone(images)
-        pooled = self.global_pool(feats).view(feats.size(0), -1)  # (B, 2048)
-        features = self.feature_layer(pooled)  # (B, feature_dim)
-        logits = self.classifier(features)
-
-        if return_features:
-            return logits, features
-        return logits
-
-
 # ============================================================================
 # TRAINING AND EVALUATION FUNCTIONS
 # ============================================================================
 
 
-def train_joint_epoch(
-    image_model,
+def train_one_epoch(
     video_model,
-    image_loader,
-    video_loader,
-    image_head_optimizer,
-    video_head_optimizer,
-    backbone_optimizer,
-    center_optimizer,
+    video_train_loader: DataLoader,
+    video_head_optimizer: torch.optim.Optimizer,
+    video_scheduler: torch.optim.lr_scheduler._LRScheduler,
     device,
-    center_loss_fn,
-    image_scheduler,
-    video_scheduler,
-    backbone_scheduler,
-    alpha_center=0.5,
     alpha_video=0.5,
     video_loss_type="triplet_standard",
     mining="hard",
-    start_iter=0,
-    max_iters=8000,
 ):
-    """Train both image and video models jointly for one epoch.
-    Args:
-        image_model: Image classification model
-        video_model: Video classification model
-        image_loader: DataLoader for image data
-        video_loader: DataLoader for video data
-        image_optimizer: Optimizer for image model
-        video_optimizer: Optimizer for video model
-        center_optimizer: Optimizer for center loss parameters
-        device: Device to run training on
-        center_loss_fn: Center loss function
-        alpha_center: Weight for center loss
-        alpha_video: Weight for video auxiliary loss
-        video_loss_type: Type of auxiliary loss for video model
-        mining: Mining strategy for triplet loss
-    Returns:
-        tuple:
-        - avg_image_loss: Average loss for image model
-        - avg_video_loss: Average loss for video model
-        - image_accuracy: Accuracy for image model
-        - video_accuracy: Accuracy for video model
-    """
-
-    image_model.train()
+    """Train for one epoch."""
     video_model.train()
 
-    total_image_loss = 0.0
     total_video_loss = 0.0
-    image_correct = 0
-    video_correct = 0
-    image_total = 0
-    video_total = 0
+    total_video_cls_loss = 0.0
+    correct = 0
+    total = 0
 
     # Classification loss
     cls_criterion = nn.CrossEntropyLoss()
 
-    if video_loss_type == "coherence":
-        video_aux_criterion = CoherenceLoss()
-        aux_requires_labels = False
-    else:
-        video_aux_criterion = StandardTripletLoss(margin=1.0, mining=mining)
-        aux_requires_labels = True
-
     # use_amp = device.type == "cuda"
     use_amp = False
-    img_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     vid_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    image_iter = iter(image_loader)
-    video_iter = iter(video_loader)
+    pbar = tqdm(video_train_loader, desc="Training")
 
-    # Use min() to process both together (1:1 sampling)
-    max_iters_this_epoch = min(len(image_loader), len(video_loader))
-    pbar = tqdm(range(max_iters_this_epoch), desc=f"Training (Iter {start_iter})")
-
-    iters_done = 0
-
-    for _ in pbar:
-        if start_iter + iters_done >= max_iters:
-            break
-        # ---------- IMAGE BATCH ----------
-        try:
-            images, img_labels = next(image_iter)
-        except StopIteration:
-            image_iter = iter(image_loader)
-            images, img_labels = next(image_iter)
-
-        images = images.to(device, non_blocking=True)
-        img_labels = img_labels.to(device, non_blocking=True)
-
-        # zero grads for backbone + image head + center
-        backbone_optimizer.zero_grad(set_to_none=True)
-        image_head_optimizer.zero_grad(set_to_none=True)
-        center_optimizer.zero_grad(set_to_none=True)
-
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            img_logits, img_features = image_model(images, return_features=True)
-            img_cls_loss = cls_criterion(img_logits, img_labels)
-            img_center_loss = center_loss_fn(img_features, img_labels)
-            img_loss = img_cls_loss + alpha_center * img_center_loss
-
-        img_scaler.scale(img_loss).backward()
-        img_scaler.unscale_(image_head_optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            list(image_model.feature_layer.parameters())
-            + list(image_model.classifier.parameters())
-            + list(image_model.backbone.parameters()),
-            max_norm=1.0,
-        )
-
-        # step optimizers: image head and backbone
-        img_scaler.step(image_head_optimizer)
-        img_scaler.step(backbone_optimizer)
-
-        # update centers
-        for param in center_loss_fn.parameters():
-            if param.grad is not None:
-                param.grad.data *= 1.0 / alpha_center
-        img_scaler.step(center_optimizer)
-        img_scaler.update()
-
-        total_image_loss += img_loss.item()
-        _, img_pred = img_logits.max(1)
-        image_total += img_labels.size(0)
-        image_correct += img_pred.eq(img_labels).sum().item()
-
-        # ---------- VIDEO BATCH ----------
-        try:
-            frames, vid_labels, keyframe_indices = next(video_iter)
-        except StopIteration:
-            video_iter = iter(video_loader)
-            frames, vid_labels, keyframe_indices = next(video_iter)
-
-        frames = frames.to(device, non_blocking=True)
-        vid_labels = vid_labels.to(device, non_blocking=True)
+    for frames, vid_labels, keyframe_indices in pbar:
+        frames = frames.to(device)
+        vid_labels = vid_labels.to(device)
         keyframe_indices = keyframe_indices.to(device)
 
-        backbone_optimizer.zero_grad(set_to_none=True)
         video_head_optimizer.zero_grad(set_to_none=True)
 
+        # Forward pass
         with torch.amp.autocast("cuda", enabled=use_amp):
             vid_logits, vid_features = video_model(
                 frames, keyframe_indices, return_features=True
             )
+
             vid_cls_loss = cls_criterion(vid_logits, vid_labels)
 
+            # Auxiliary loss
             batch_size, num_frames = frames.shape[0], frames.shape[1]
-            if aux_requires_labels and video_loss_type == "triplet_standard":
-                frame_labels = vid_labels.unsqueeze(1).expand(-1, num_frames)
-                vid_aux_loss = video_aux_criterion(
-                    vid_features["frame_features"], frame_labels
-                )
-            else:
-                vid_aux_loss = video_aux_criterion(
+
+            if video_loss_type == "coherence":
+                aux_criterion = CoherenceLoss()
+                vid_aux_loss = aux_criterion(
                     vid_features["frame_features"], vid_features["keyframe_center"]
+                )
+            elif video_loss_type == "triplet_standard":
+                frame_labels = vid_labels.unsqueeze(1).expand(-1, num_frames)
+                aux_criterion = StandardTripletLoss(margin=1.0, mining=mining)
+                vid_aux_loss = aux_criterion(
+                    vid_features["frame_features"], frame_labels
                 )
 
             # Combined loss: classification + alpha * coherence/triplet loss
@@ -913,42 +729,35 @@ def train_joint_epoch(
         )
 
         vid_scaler.step(video_head_optimizer)
-        vid_scaler.step(
-            backbone_optimizer
-        )  # update shared backbone again for video batch
         vid_scaler.update()
 
+        # Statistics
         total_video_loss += vid_loss.item()
+        total_video_cls_loss += vid_cls_loss.item()
+
         _, vid_pred = vid_logits.max(1)
         video_total += vid_labels.size(0)
         video_correct += vid_pred.eq(vid_labels).sum().item()
 
-        iters_done += 1
-
         # Step schedulers per iteration
-        image_scheduler.step()
         video_scheduler.step()
-        backbone_scheduler.step()
 
         # Update progress bar
         pbar.set_postfix(
             {
-                "iter": f"{start_iter + iters_done}/{max_iters}",
-                "img_acc": f"{100.*image_correct/image_total:.1f}%",
+                "vid_loss": f"{vid_loss.item():.4f}",
                 "vid_acc": f"{100.*video_correct/video_total:.1f}%",
             }
         )
 
         # free memory
-        del images, img_labels, frames, vid_labels, keyframe_indices
+        del frames, vid_labels, keyframe_indices
 
-    return (
-        total_image_loss / iters_done,  # average image loss
-        total_video_loss / iters_done,  # average video loss
-        100.0 * image_correct / image_total,  # image accuracy
-        100.0 * video_correct / video_total,  # video accuracy
-        iters_done,  # return iteration count
-    )
+    avg_video_loss = total_video_loss / len(video_train_loader)
+    avg_video_cls_loss = total_video_cls_loss / len(video_train_loader)
+    video_accuracy = 100.0 * correct / total
+
+    return avg_video_loss, avg_video_cls_loss, video_accuracy
 
 
 def validate(model, val_loader, device):
@@ -989,125 +798,29 @@ def validate(model, val_loader, device):
     return avg_loss, accuracy
 
 
-def train_joint_kga_net(
-    image_root_dir,
-    image_annotation_file,
+def train_kga_net(
     video_root_dir,
-    video_train_annotation,
-    video_val_annotation,
+    video_train_annotation="imagenet_vid_train_15frames.json",
+    video_val_annotation="imagenet_vid_val.json",
     # Training params
-    total_iter=8000,
-    image_batch_size=32,
+    num_epochs=50,
     video_batch_size=4,
     num_frames=32,
-    image_lr=0.001,
     video_lr=0.0001,
-    alpha_center=0.5,
     alpha_video=0.5,
-    feature_dim=512,
     video_loss_type="triplet_standard",
     mining="hard",
     train_split=0.8,
-    save_dir="checkpoints/joint_model",
+    save_dir="checkpoints/video_only_checkpoints",
     num_workers=4,
 ):
     """
-    Train image and video models jointly.
-
-    Args:
-        image_root_dir: Root directory for image dataset
-        image_annotation_file: Annotation file for image dataset
-        video_root_dir: Root directory for video dataset
-        video_train_annotation: Training annotation file for video dataset
-        video_val_annotation: Validation annotation file for video dataset
-        total_iter: Total number of iterations
-        image_batch_size: Batch size for image model
-        video_batch_size: Batch size for video model
-        num_frames: Number of frames per video
-        image_lr: Learning rate for image model
-        video_lr: Learning rate for video model
-        alpha_center: Weight for center loss
-        alpha_video: Weight for video auxiliary loss
-        feature_dim: Feature dimension for image model
-        video_loss_type: Type of auxiliary loss for video model
-        mining: Mining strategy for triplet loss ('hard', 'semi-hard', 'all')
-        train_split: Train/validation split ratio for image dataset
-        save_dir: Directory to save checkpoints
-        num_workers: Number of DataLoader workers
-
-    Returns:
-        tuple:
-        - image_model: Trained image classification model
-        - video_model: Trained video classification model
-
+    Complete training pipeline for KGA-Net.
     """
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-
-    # ==================== CREATE IMAGE DATALOADERS ====================
-    logger.info("\nLoading image dataset...")
-
-    train_img_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.RandomCrop((224, 224)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-
-    val_img_transform = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-
-    full_image_dataset = BUSIImageDataset(image_root_dir, image_annotation_file)
-    total_size = len(full_image_dataset)
-    train_size = int(total_size * train_split)
-    val_size = total_size - train_size
-
-    torch.manual_seed(42)
-    train_indices, val_indices = torch.utils.data.random_split(
-        range(total_size), [train_size, val_size]
-    )
-
-    train_image_dataset = BUSIImageDataset(
-        image_root_dir, image_annotation_file, train_img_transform
-    )
-    train_image_dataset = torch.utils.data.Subset(
-        train_image_dataset, train_indices.indices
-    )
-
-    val_image_dataset = BUSIImageDataset(
-        image_root_dir, image_annotation_file, val_img_transform
-    )
-    val_image_dataset = torch.utils.data.Subset(val_image_dataset, val_indices.indices)
-
-    image_train_loader = DataLoader(
-        train_image_dataset,
-        batch_size=image_batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    image_val_loader = DataLoader(
-        val_image_dataset,
-        batch_size=image_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    logger.info(f"Image training samples: {len(train_image_dataset)}")
-    logger.info(f"Image validation samples: {len(val_image_dataset)}")
 
     # ==================== CREATE VIDEO DATALOADERS ====================
     logger.info("\nLoading video dataset...")
@@ -1119,20 +832,14 @@ def train_joint_kga_net(
         num_frames=num_frames,
         num_workers=num_workers,
     )
-    logger.info(f"Video training samples: {len(video_train_loader.dataset)}")
-    logger.info(f"Video validation samples: {len(video_val_loader.dataset)}")
+
+    logger.info(f"Training samples: {len(video_train_loader.dataset)}")
+    logger.info(f"Validation samples: {len(video_val_loader.dataset)}")
+    logger.info(f"Training batches: {len(video_train_loader)}")
+    logger.info(f"Validation batches: {len(video_val_loader)}")
 
     # ==================== CREATE MODELS ====================
     logger.info("\nInitializing models...")
-    resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-    shared_backbone = nn.Sequential(*list(resnet.children())[:-2]).to(device)
-
-    image_model = ImageClassificationNetwork(
-        num_classes=2,
-        feature_dim=feature_dim,
-        pretrained=False,
-        backbone=shared_backbone,
-    ).to(device)
 
     video_model = KGANet(
         num_classes=2,
@@ -1140,59 +847,21 @@ def train_joint_kga_net(
         reduction=16,
         aggregation_type="attention",
         pretrained=False,
-        backbone=shared_backbone,
+        backbone=None,
     ).to(device)
 
-    # center loss (feature_dim must match image_model feature_layer output)
-    center_loss_fn = CenterLoss(num_classes=2, feature_dim=feature_dim, device=device)
+    logger.info(
+        f"Model parameters: {sum(p.numel() for p in video_model.parameters()):,}"
+    )
 
-    # ---------------- OPTIMIZERS and SCHEDULERS ----------------
-    # backbone optimizer (shared)
-    backbone_optimizer = torch.optim.SGD(
-        shared_backbone.parameters(),
+    # ================= OPTIMIZERS and SCHEDULERS =================
+    video_head_optimizer = torch.optim.SGD(
+        video_model.parameters(),
         lr=video_lr,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-
-    # image-specific optimizer: feature_layer + classifier
-    image_head_params = list(image_model.feature_layer.parameters()) + list(
-        image_model.classifier.parameters()
-    )
-    image_head_optimizer = torch.optim.SGD(
-        image_head_params,
-        lr=image_lr,
         momentum=0.9,
         nesterov=True,
         weight_decay=1e-3,  # Increase from 1e-4
     )
-
-    # video-specific optimizer: kga, kfc, temporal_agg, classifier
-    video_head_params = []
-    # collect video head params (exclude backbone)
-    for name, p in video_model.named_parameters():
-        if "backbone" in name:
-            continue
-        video_head_params.append(p)
-        video_head_optimizer = torch.optim.SGD(
-            video_head_params,
-            lr=video_lr,
-            momentum=0.9,
-            nesterov=True,
-            weight_decay=1e-3,  # Increase from 1e-4
-        )
-
-    center_optimizer = torch.optim.SGD(
-        center_loss_fn.parameters(), nesterov=True, lr=0.5, momentum=0.9, dampening=0
-    )
-
-    # Calculate total iterations (limited by smaller dataset)
-    iterations_per_epoch = min(len(image_train_loader), len(video_train_loader))
-    num_epochs = math.ceil(total_iter / iterations_per_epoch)
-
-    logger.info(f"Iterations per epoch: {iterations_per_epoch}")
-    logger.info(f"Training for {num_epochs} epochs to reach {total_iter} iterations")
 
     # Iteration-based LR schedule
     def lr_lambda(current_iter):
@@ -1205,137 +874,81 @@ def train_joint_kga_net(
         else:
             return 0.01
 
-    image_scheduler = torch.optim.lr_scheduler.LambdaLR(image_head_optimizer, lr_lambda)
     video_scheduler = torch.optim.lr_scheduler.LambdaLR(video_head_optimizer, lr_lambda)
-    backbone_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        backbone_optimizer, lr_lambda
-    )
 
-    logger.info(f"\nStarting joint training...")
-    best_img_acc = 0.0
+    # Training loop
+    print(f"\nStarting training with {video_loss_type} loss...")
+    print("=" * 70)
+
     best_vid_acc = 0.0
-    global_iter = 0
 
     for epoch in range(num_epochs):
-        if global_iter >= total_iter:
-            break
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print("-" * 70)
 
-        logger.info(f"\nEpoch {epoch+1}/{num_epochs} (Iter {global_iter}/{total_iter})")
-
-        # Modified train function to return iteration count
-        img_loss, vid_loss, img_acc, vid_acc, iters_done = train_joint_epoch(
-            image_model,
-            video_model,
-            image_train_loader,
-            video_train_loader,
-            image_head_optimizer,
-            video_head_optimizer,
-            backbone_optimizer,
-            center_optimizer,
-            device,
-            center_loss_fn,
-            image_scheduler,
-            video_scheduler,
-            backbone_scheduler,
-            alpha_center,
-            alpha_video,
-            video_loss_type,
-            mining,
-            global_iter,
-            TOTAL_ITERATIONS,
+        # Train
+        avg_video_loss, avg_video_cls_loss, video_accuracy = train_one_epoch(
+            video_model=video_model,
+            video_train_loader=video_train_loader,
+            video_head_optimizer=video_head_optimizer,
+            video_scheduler=video_scheduler,
+            device=device,
+            video_loss_type=video_loss_type,
+            alpha_video=alpha_video,
         )
-
-        global_iter += iters_done
-
-        logger.info(f"Train - Image Loss: {img_loss:.4f}, Acc: {img_acc:.2f}%")
-        logger.info(f"Train - Video Loss: {vid_loss:.4f}, Acc: {vid_acc:.2f}%")
-
-        # Validation
-        image_model.eval()
-        img_correct, img_total = 0, 0
-        with torch.no_grad():
-            for images, labels in image_val_loader:
-                images, labels = images.to(device), labels.to(device)
-                logits = image_model(images)
-                _, pred = logits.max(1)
-                img_total += labels.size(0)
-                img_correct += pred.eq(labels).sum().item()
-        val_img_acc = 100.0 * img_correct / img_total
-
-        val_vid_loss, val_vid_acc = validate(video_model, video_val_loader, device)
 
         logger.info(
-            f"Val   - Image Acc: {val_img_acc:.2f}%, Video Acc: {val_vid_acc:.2f}%"
+            f"Train - Video Loss: {avg_video_loss:.4f}, Acc: {video_accuracy:.2f}%, Cls Loss: {avg_video_cls_loss:.4f}"
         )
 
-        # Save image and video model checkpoints after each 10 epochs
-        if (epoch + 1) % 60 == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "backbone_state": shared_backbone.state_dict(),
-                    "image_head": image_model.state_dict(),
-                    "val_acc": val_img_acc,
-                },
-                os.path.join(save_dir, f"image_model_epoch_{epoch+1}.pth"),
-            )
-            logger.info(f"✓ Saved image model checkpoint for epoch {epoch+1}")
+        # Validate
+        val_vid_loss, val_vid_acc = validate(video_model, val_loader, device)
 
-            if video_loss_type == "triplet_standard":
-                vid_loss_type_str = f"{video_loss_type}_{mining}"
-            else:
-                vid_loss_type_str = video_loss_type
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "backbone_state": shared_backbone.state_dict(),
-                    "video_head": video_model.state_dict(),
-                    "val_acc": val_vid_acc,
-                },
-                os.path.join(
-                    save_dir, f"video_model_{vid_loss_type_str}_epoch_{epoch+1}.pth"
-                ),
-            )
-            logger.info(f"✓ Saved video model checkpoint for epoch {epoch+1}")
+        print(f"Val   - Loss: {val_vid_loss:.4f}, Acc: {val_vid_acc:.2f}%")
 
-        # Save best models
-        if val_img_acc > best_img_acc:
-            best_img_acc = val_img_acc
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "backbone_state": shared_backbone.state_dict(),
-                    "image_head": image_model.state_dict(),  # contains backbone entries too but same values
-                    "val_acc": val_img_acc,
-                },
-                os.path.join(save_dir, "best_image_model.pth"),
-            )
-            logger.info(f"✓ Saved best image model (Acc: {val_img_acc:.2f}%)")
+        # Learning rate scheduling
+        old_lr = video_head_optimizer.param_groups[0]["lr"]
+        video_scheduler.step(val_vid_acc)
+        new_lr = video_head_optimizer.param_groups[0]["lr"]
+        if old_lr != new_lr:
+            print(f"Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
 
+        # Save best model
         if val_vid_acc > best_vid_acc:
             best_vid_acc = val_vid_acc
-            if video_loss_type == "triplet_standard":
-                vid_loss_type_str = f"{video_loss_type}_{mining}"
-            else:
-                vid_loss_type_str = video_loss_type
+            checkpoint_path = os.path.join(save_dir, f"best_model_{loss_type}.pth")
             torch.save(
                 {
                     "epoch": epoch,
-                    "backbone_state": shared_backbone.state_dict(),
-                    "video_head": video_model.state_dict(),
+                    "model_state_dict": video_model.state_dict(),
+                    "optimizer_state_dict": video_head_optimizer.state_dict(),
                     "val_acc": val_vid_acc,
+                    "train_acc": video_accuracy,
                 },
-                os.path.join(save_dir, f"best_video_model_{vid_loss_type_str}.pth"),
+                checkpoint_path,
             )
-            logger.info(f"✓ Saved best video model (Acc: {val_vid_acc:.2f}%)")
+            print(f"✓ Saved best model (Val Acc: {val_vid_acc:.2f}%)")
+
+        # Save checkpoint every 60 epochs
+        if (epoch + 1) % 60 == 0:
+            checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": video_model.state_dict(),
+                    "optimizer_state_dict": video_head_optimizer.state_dict(),
+                    "val_acc": val_vid_acc,
+                    "train_acc": video_accuracy,
+                },
+                checkpoint_path,
+            )
 
     logger.info("\n" + "=" * 70)
     logger.info(f"Training completed!")
-    logger.info(f"Best Image Acc: {best_img_acc:.2f}%")
     logger.info(f"Best Video Acc: {best_vid_acc:.2f}%")
     logger.info("=" * 70)
 
-    return image_model, video_model
+    return video_model
 
 
 # ============================================================================
@@ -1348,18 +961,16 @@ if __name__ == "__main__":
     # ========================================================================
 
     # Dataset configuration
-    IMAGE_ROOT_DIR = "./data/busi/"
-    IMAGE_ANNOTATION = "data/busi_bboxes.json"
-    VIDEO_ROOT_DIR = "./data"
-    VIDEO_TRAIN_ANNOTATION = "imagenet_vid_train_15frames.json"
-    VIDEO_VAL_ANNOTATION = "imagenet_vid_val.json"
+    ROOT_DIR = "./data"  # Change this to your dataset path
+    TRAIN_ANNOTATION = "imagenet_vid_train_15frames.json"
+    VAL_ANNOTATION = "imagenet_vid_val.json"
 
     # Training configuration
     TOTAL_ITERATIONS = 8000
-    IMAGE_BATCH_SIZE = 8
+    NUM_EPOCHS = 422
     VIDEO_BATCH_SIZE = 8
     NUM_FRAMES = 32
-    LEARNING_RATE = 0.005  # 0.001, 5e-3, 7e-4
+    LEARNING_RATE = 0.005
 
     # Loss configuration
     # Options: 'coherence', 'triplet_coherence', 'triplet_standard'
@@ -1368,62 +979,75 @@ if __name__ == "__main__":
     ALPHA = 0.5  # Weight for auxiliary loss
     ALPHA_CENTER = 0.5  # Weight for center loss
 
-    # Path to save Checkpoints
-    SAVE_DIR = "notebooks/joint_checkpoints"
+    # Save configuration
+    SAVE_DIR = "notebooks/video_only_checkpoints"
 
     # ========================================================================
     # Start Training
     # ========================================================================
+
     print("=" * 70)
     print("KGA-Net Training Pipeline")
     print("=" * 70)
-    # for LOSS_TYPE, MINING in [
-    #     ("coherence", None),
-    #     # ("triplet_standard", "hard"),
-    #     # ("triplet_standard", "semi-hard"),
-    #     # ("triplet_standard", "all"),
-    # ]:
-    for ALPHA in [0.2, 0.5, 0.8]:
-        for NUM_FRAMES in [8, 16, 32]:
-            logger.info("\n" + "=" * 70)
-            logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
-            logger.info(f"Image Batch Size: {IMAGE_BATCH_SIZE}")
-            logger.info(f"Number of Frames: {NUM_FRAMES}")
-            logger.info(f"Learning Rate: {LEARNING_RATE}")
-            logger.info(f"Alpha (Auxiliary Loss Weight): {ALPHA}")
-            logger.info(f"Alpha Center (Center Loss Weight): {ALPHA_CENTER}")
-            logger.info(f"Total Iterations:{TOTAL_ITERATIONS}")
+    logger.info("\n" + "=" * 70)
+    logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
+    logger.info(f"Number of Frames: {NUM_FRAMES}")
+    logger.info(f"Learning Rate: {LEARNING_RATE}")
+    logger.info(f"Alpha (Auxiliary Loss Weight): {ALPHA}")
+    logger.info(f"Alpha Center (Center Loss Weight): {ALPHA_CENTER}")
+    logger.info(f"Total Iterations:{TOTAL_ITERATIONS}")
 
-            if LOSS_TYPE != "triplet_standard":
-                logger.info(f"\nStarting training with loss type: {LOSS_TYPE}")
-            else:
-                logger.info(
-                    f"\nStarting training with loss type: {LOSS_TYPE}, Mining: {MINING}"
-                )
-            print("=" * 70)
+    for loss_type in ["coherence", "triplet_coherence", "triplet_standard"]:
+        print(f"\nStarting training with loss type: {loss_type}")
+        trained_model = train_kga_net(
+            root_dir=ROOT_DIR,
+            train_annotation=TRAIN_ANNOTATION,
+            val_annotation=VAL_ANNOTATION,
+            num_epochs=NUM_EPOCHS,
+            batch_size=VIDEO_BATCH_SIZE,
+            num_frames=NUM_FRAMES,
+            learning_rate=LEARNING_RATE,
+            loss_type=LOSS_TYPE,
+            alpha=ALPHA,
+            save_dir=SAVE_DIR,
+        )
 
-            image_model, video_model = train_joint_kga_net(
-                # Image dataset
-                image_root_dir=IMAGE_ROOT_DIR,
-                image_annotation_file=IMAGE_ANNOTATION,
-                # Video dataset
-                video_root_dir=VIDEO_ROOT_DIR,
-                video_train_annotation=VIDEO_TRAIN_ANNOTATION,
-                video_val_annotation=VIDEO_VAL_ANNOTATION,
-                # Config
-                total_iter=TOTAL_ITERATIONS,
-                video_loss_type=LOSS_TYPE,
-                mining=MINING,
-                alpha_video=ALPHA,
-                alpha_center=ALPHA_CENTER,
-                video_lr=LEARNING_RATE,
-                image_lr=LEARNING_RATE,
-                image_batch_size=IMAGE_BATCH_SIZE,
-                video_batch_size=VIDEO_BATCH_SIZE,
+        print("\n✓ Training completed successfully!")
+        print(f"✓ Model checkpoints saved in: {SAVE_DIR}/")
+
+        # ====================================================================
+        # Optional: Load and test the best model
+        # ====================================================================
+
+        print("\n" + "=" * 70)
+        print("Testing Best Model")
+        print("=" * 70)
+
+        # Load best model
+        checkpoint_path = os.path.join(SAVE_DIR, f"best_model_{LOSS_TYPE}.pth")
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path)
+            trained_model.load_state_dict(checkpoint["model_state_dict"])
+            print(f"✓ Loaded best model from epoch {checkpoint['epoch']+1}")
+            print(f"  Training Accuracy: {checkpoint['train_acc']:.2f}%")
+            print(f"  Validation Accuracy: {checkpoint['val_acc']:.2f}%")
+
+            # Test on validation set
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            trained_model.eval()
+
+            _, val_loader = video_dataloader(
+                root_dir=ROOT_DIR,
+                train_annotation=TRAIN_ANNOTATION,
+                val_annotation=VAL_ANNOTATION,
+                batch_size=VIDEO_BATCH_SIZE,
                 num_frames=NUM_FRAMES,
-                save_dir=SAVE_DIR,
+                num_workers=4,
             )
 
-    print("\n✓ Training completed successfully!")
-    print(f"✓ Model checkpoints saved in: {SAVE_DIR}/")
-    print("\n" + "=" * 70)
+            val_vid_loss, val_vid_acc = validate(trained_model, val_loader, device)
+            print(f"\nFinal Test Results:")
+            print(f"  Loss: {val_vid_loss:.4f}")
+            print(f"  Accuracy: {val_vid_acc:.2f}%")
+
+        print("\n" + "=" * 70)
