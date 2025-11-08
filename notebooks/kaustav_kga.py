@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +9,7 @@ import os
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
+from sklearn.metrics import roc_curve
 from tqdm import tqdm
 import logging
 
@@ -339,107 +341,32 @@ def video_dataloader(
 # ============================================================================
 
 
-class KeyframeFeatureCenter(nn.Module):
-    """Keyframe Feature Center (KFC) module."""
+class FrameAttention(nn.Module):
+    """
+    Simple frame attention module that produces scalar weight per frame.
+    Paper Eq. 1: w_i = Sigmoid(FC(F_i))
+    """
 
     def __init__(self, feature_dim):
-        super(KeyframeFeatureCenter, self).__init__()
-        self.feature_dim = feature_dim
+        super().__init__()
+        self.fc = nn.Linear(feature_dim, 1)
 
-    def forward(self, keyframe_features):
-        """
-        Compute the center of keyframe features by averaging.
-
-        Args:
-            keyframe_features: Tensor of shape (batch_size, num_keyframes, channels, height, width)
-                - batch_size: Number of videos in the batch
-                - num_keyframes: Number of keyframes per video
-                - channels: Number of feature channels (e.g., 2048 for ResNet-50)
-                - height: Spatial height of feature maps
-                - width: Spatial width of feature maps
-
-        Returns:
-            center: Tensor of shape (batch_size, channels, height, width)
-                - Averaged keyframe features representing the keyframe center
-        """
-        center = torch.mean(keyframe_features, dim=1)
-        return center
-
-
-class KeyframeGuidanceAttention(nn.Module):
-    """
-    Keyframe Guidance Attention (KGA) module
-    Uses keyframe feature center to guide attention on video frames"""
-
-    def __init__(self, feature_dim, reduction=16):
-        super(KeyframeGuidanceAttention, self).__init__()
-        self.feature_dim = feature_dim
-
-        self.conv1 = nn.Conv2d(feature_dim * 2, feature_dim // reduction, 1)
-        self.conv2 = nn.Conv2d(feature_dim // reduction, feature_dim, 1)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(
-        self, frame_features: torch.Tensor, keyframe_center: torch.Tensor
-    ) -> torch.Tensor:
-        batch_size, num_frames, channels, height, width = frame_features.shape
-
-        keyframe_center_expanded = keyframe_center.unsqueeze(1).expand(
-            -1, num_frames, -1, -1, -1
-        )
-        concatenated = torch.cat([frame_features, keyframe_center_expanded], dim=2)
-        concatenated = concatenated.view(
-            batch_size * num_frames, channels * 2, height, width
-        )
-
-        attention = self.conv1(concatenated)
-        attention = self.relu(attention)
-        attention = self.conv2(attention)
-        attention = self.sigmoid(attention)
-        attention = attention.view(batch_size, num_frames, channels, height, width)
-
-        attended_features = frame_features * attention
-        return attended_features
-
-
-class TemporalAggregation(nn.Module):
-    """Temporal aggregation module to combine frame-level features"""
-
-    def __init__(self, feature_dim, aggregation_type="avg"):
-        super(TemporalAggregation, self).__init__()
-        self.aggregation_type = aggregation_type
-
-        if aggregation_type == "attention":
-            self.attention_fc = nn.Sequential(
-                nn.Linear(feature_dim, feature_dim // 4),
-                nn.ReLU(),
-                nn.Linear(feature_dim // 4, 1),
-            )
-
-    def forward(self, features):
+    def forward(self, frame_features):
         """
         Args:
-            features: (Batch_size, num_frames, Channels, Height, Width) - frame features
+            frame_features: (B, N, C, H, W)
         Returns:
-            aggregated: (Batch_size, Channels, Height, Width) - temporally aggregated features
+            weights: (B, N, 1, 1, 1)
         """
-        if self.aggregation_type == "avg":
-            aggregated = torch.mean(features, dim=1)
-        elif self.aggregation_type == "max":
-            aggregated = torch.max(features, dim=1)[0]
-        elif self.aggregation_type == "attention":
-            batch_size, num_frames, channels, height, width = features.shape
-            frame_vectors = F.adaptive_avg_pool2d(
-                features.view(batch_size * num_frames, channels, height, width), 1
-            ).view(batch_size, num_frames, channels)
+        B, N, C, H, W = frame_features.shape
+        # Global average pooling per frame
+        frame_vectors = F.adaptive_avg_pool2d(
+            frame_features.view(B * N, C, H, W), 1
+        ).view(B, N, C)
 
-            attention_weights = self.attention_fc(frame_vectors)
-            attention_weights = F.softmax(attention_weights, dim=1)
-            attention_weights = attention_weights.unsqueeze(-1).unsqueeze(-1)
-            aggregated = torch.sum(features * attention_weights, dim=1)
-
-        return aggregated
+        # Compute scalar attention weight per frame
+        weights = torch.sigmoid(self.fc(frame_vectors))  # (B, N, 1)
+        return weights.view(B, N, 1, 1, 1)
 
 
 # ============================================================================
@@ -470,19 +397,60 @@ class CenterLoss(nn.Module):
 
 
 class CoherenceLoss(nn.Module):
-    """Coherence Loss from the original KGA-Net paper."""
+    """
+    Coherence Loss from paper Eq. 3
+    L_Coh = ||Gram_w - Gram_d||_2
 
-    def __init__(self):
-        super(CoherenceLoss, self).__init__()
+    Guides attention weights to align with feature distances to class centers
+    """
 
-    def forward(self, frame_features, keyframe_center):
-        batch_size, num_frames, channels, height, width = frame_features.shape
-        keyframe_center_expanded = keyframe_center.unsqueeze(1).expand(
-            -1, num_frames, -1, -1, -1
-        )
-        diff = frame_features - keyframe_center_expanded
-        loss = torch.mean(diff**2)
-        return loss
+    def __init__(self, in_features=2048, out_features=512, device="cuda"):
+        super().__init__()
+        # self.feature_projection = nn.Linear(in_features, out_features).to(device)
+
+    def forward(self, frame_features, attention_weights, class_centers, labels):
+        """
+        Args:
+            frame_features: (B, N, C, H, W) - frame feature maps
+            attention_weights: (B, N, 1, 1, 1) - attention weights from frame attention
+            class_centers: (num_classes, feature_dim) - class centers from center loss
+            labels: (B,) - video labels
+        """
+        B, N, C, H, W = frame_features.shape
+
+        device = frame_features.device  # Get device from input tensor
+
+        # Convert feature maps to vectors via global pooling
+        frame_vectors = F.adaptive_avg_pool2d(
+            frame_features.view(B * N, C, H, W), 1
+        ).view(B, N, C)
+
+        total_loss = 0.0
+        for i in range(B):
+            # Get class center for this video
+            center = class_centers[labels[i]]  # (512,)
+
+            # Compute feature distances (Paper Eq. 2)
+            distances = torch.norm(
+                frame_vectors[i] - center.unsqueeze(0), dim=1
+            )  # (N,)
+
+            # Get attention weights for this video
+            weights = attention_weights[i].squeeze()  # (N,)
+
+            # Normalize
+            d_norm = distances / (distances.norm() + 1e-8)
+            w_norm = (1 - weights) / ((1 - weights).norm() + 1e-8)
+
+            # Compute Gram matrices
+            gram_d = torch.outer(d_norm, d_norm)  # (N, N)
+            gram_w = torch.outer(w_norm, w_norm)  # (N, N)
+
+            # L2 loss between Gram matrices
+            loss = torch.norm(gram_w - gram_d)
+            total_loss += loss
+
+        return total_loss / B
 
 
 class StandardTripletLoss(nn.Module):
@@ -598,89 +566,68 @@ class KGANet(nn.Module):
         use_gradient_checkpointing: Whether to use gradient checkpointing
     """
 
-    def __init__(
-        self,
-        num_classes=2,
-        feature_dim=2048,
-        reduction=16,
-        aggregation_type="attention",
-        pretrained=True,
-        backbone=None,
-        use_gradient_checkpointing=True,
-    ):
-        super(KGANet, self).__init__()
-        self.use_gradient_checkpointing = use_gradient_checkpointing
+    def __init__(self, num_classes=2, feature_dim=2048, backbone=None):
+        super().__init__()
 
-        # Use provided backbone if available (shared). Backbone should give spatial features (B, C, H, W)
+        # Backbone (ResNet-50 without avgpool and fc)
         if backbone is not None:
             self.backbone = backbone
         else:
-            if pretrained:
-                weights = ResNet50_Weights.IMAGENET1K_V2
-            else:
-                weights = None
-            resnet = resnet50(weights=weights)
-            self.backbone = nn.Sequential(
-                *list(resnet.children())[:-2]
-            )  # Remove avgpool and fc
+            resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+            self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        self.kfc = KeyframeFeatureCenter(feature_dim)
-        self.kga = KeyframeGuidanceAttention(feature_dim, reduction)
-        self.temporal_agg = TemporalAggregation(feature_dim, aggregation_type)
+        # Frame attention module
+        self.frame_attention = FrameAttention(feature_dim)
 
+        # Classification head
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
-            nn.Dropout(0.6),  # Increase from 0.5
+            nn.Dropout(0.5),
             nn.Linear(feature_dim, 512),
             nn.ReLU(),
-            nn.Dropout(0.4),  # Increase from 0.3
+            nn.Dropout(0.3),
             nn.Linear(512, num_classes),
         )
 
-    def forward(
-        self,
-        video_frames: torch.Tensor,
-        keyframe_indices: torch.Tensor = None,
-        return_features: bool = False,
-    ):
+    def forward(self, video_frames, return_features=False) -> torch.Tensor:
+        """
+        Forward pass for video classification.
 
+        Args:
+            video_frames: (B, N, 3, H, W) - video frames
+            return_features: whether to return intermediate features
+
+        Note: keyframe_indices parameter removed - not used in the paper's method
+        """
         batch_size, num_frames, rgb_channels, height, width = video_frames.shape
 
+        # Extract frame features
         frames_flat = video_frames.view(
             batch_size * num_frames, rgb_channels, height, width
         )
-        features_flat = self.backbone(frames_flat)  # (B*N, C, Hf, Wf)
-        _, feat_channels, feat_height, feat_width = features_flat.shape
+        features_flat = self.backbone(frames_flat)  # (B*N, 2048, h, w)
+        _, feat_dim, feat_h, feat_w = features_flat.shape
         frame_features = features_flat.view(
-            batch_size, num_frames, feat_channels, feat_height, feat_width
-        )
+            batch_size, num_frames, feat_dim, feat_h, feat_w
+        )  # (B, N, 2048, h, w)
 
-        if keyframe_indices is None:
-            keyframe_features = frame_features[:, 0:1, :, :, :]
-        else:
-            # gather keyframe features
-            k = keyframe_indices.shape[1]
-            idx = keyframe_indices.view(batch_size, k, 1, 1, 1).expand(
-                -1, -1, feat_channels, feat_height, feat_width
-            )
-            keyframe_features = torch.gather(frame_features, dim=1, index=idx)
+        # Compute attention weights (Paper Eq. 1)
+        attention_weights = self.frame_attention(frame_features)  # (B, N, 1, 1, 1)
 
-        keyframe_center = self.kfc(keyframe_features)
-        attended_features = self.kga(frame_features, keyframe_center)
-        aggregated_features = self.temporal_agg(attended_features)
+        # Weighted aggregation
+        weighted_features = frame_features * attention_weights
+        aggregated = weighted_features.sum(dim=1)  # (B, C, h, w)
 
-        pooled = self.global_pool(aggregated_features).view(batch_size, -1)
+        # Classification
+        pooled = self.global_pool(aggregated).view(batch_size, -1)  # (B, C)
         logits = self.classifier(pooled)
 
         if return_features:
-            features_dict = {
+            return logits, {
                 "frame_features": frame_features,
-                "keyframe_center": keyframe_center,
-                "attended_features": attended_features,
-                "aggregated_features": aggregated_features,
+                "attention_weights": attention_weights,
+                "aggregated_features": aggregated,
             }
-            return logits, features_dict
-
         return logits
 
 
@@ -705,38 +652,68 @@ class ImageClassificationNetwork(nn.Module):
         # For image classification we pool the spatial feature map to a vector
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        # convert 2048 -> feature_dim
-        # self.feature_layer = nn.Sequential(
-        #     nn.Linear(2048, feature_dim),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.5),  # Increase from 0.3
-        # )
-
         """To-DO: Experiment with adding LayerNorm here"""
-        self.feature_layer = nn.Sequential(
-            nn.Linear(2048, feature_dim),
-            nn.LayerNorm(feature_dim),  # Add normalization
-            nn.ReLU(),
-            nn.Dropout(0.5),
-        )
-
-        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(2048, num_classes))
 
     def forward(self, images: torch.Tensor, return_features: bool = False):
         # images: (Batch_size, 3, Height, Width) -> backbone -> (Batch_size, 2048, feat_H, feat_W)
         feats = self.backbone(images)
         pooled = self.global_pool(feats).view(feats.size(0), -1)  # (B, 2048)
-        features = self.feature_layer(pooled)  # (B, feature_dim)
-        logits = self.classifier(features)
+        logits = self.classifier(pooled)
 
         if return_features:
-            return logits, features
+            return logits, pooled
         return logits
 
 
 # ============================================================================
 # TRAINING AND EVALUATION FUNCTIONS
 # ============================================================================
+
+
+def calculate_youden_threshold(model, val_loader, device):
+    """Calculate optimal classification threshold using Youden's index.
+
+    Args:
+        model: Trained model
+        val_loader: Validation data loader
+        device: Device to run inference on
+
+    Returns:
+        float: Optimal threshold value
+    """
+    model.eval()
+    all_probs = []
+    all_labels = []
+
+    with torch.no_grad():
+        for x in val_loader:
+            # Unpack batch based on image or video dataset
+            if len(x) == 2:
+                inputs, labels = x
+            else:
+                inputs, labels, _ = x
+            if isinstance(inputs, (list, tuple)):
+                inputs = inputs.to(device)
+            else:
+                inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)[:, 1]  # Positive class probability
+
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    # Convert to numpy arrays
+    probs = np.array(all_probs)
+    labels = np.array(all_labels)
+
+    # find optimal threshold
+    fpr, tpr, thresholds = roc_curve(labels, probs)
+    idx = np.argmax(tpr - fpr)  # Youden's index
+
+    return thresholds[idx]
 
 
 def train_joint_epoch(
@@ -754,34 +731,13 @@ def train_joint_epoch(
     video_scheduler,
     backbone_scheduler,
     alpha_center=0.5,
-    alpha_video=0.5,
-    video_loss_type="triplet_standard",
+    alpha_video=1,
+    video_loss_type="coherence",
     mining="hard",
     start_iter=0,
     max_iters=8000,
 ):
-    """Train both image and video models jointly for one epoch.
-    Args:
-        image_model: Image classification model
-        video_model: Video classification model
-        image_loader: DataLoader for image data
-        video_loader: DataLoader for video data
-        image_optimizer: Optimizer for image model
-        video_optimizer: Optimizer for video model
-        center_optimizer: Optimizer for center loss parameters
-        device: Device to run training on
-        center_loss_fn: Center loss function
-        alpha_center: Weight for center loss
-        alpha_video: Weight for video auxiliary loss
-        video_loss_type: Type of auxiliary loss for video model
-        mining: Mining strategy for triplet loss
-    Returns:
-        tuple:
-        - avg_image_loss: Average loss for image model
-        - avg_video_loss: Average loss for video model
-        - image_accuracy: Accuracy for image model
-        - video_accuracy: Accuracy for video model
-    """
+    """Train both image and video models jointly for one epoch."""
 
     image_model.train()
     video_model.train()
@@ -796,12 +752,13 @@ def train_joint_epoch(
     # Classification loss
     cls_criterion = nn.CrossEntropyLoss()
 
+    # Initialize auxiliary loss
     if video_loss_type == "coherence":
-        video_aux_criterion = CoherenceLoss()
-        aux_requires_labels = False
-    else:
+        video_aux_criterion = CoherenceLoss(device=device)
+    elif video_loss_type == "triplet_standard":
         video_aux_criterion = StandardTripletLoss(margin=1.0, mining=mining)
-        aux_requires_labels = True
+    else:
+        raise ValueError(f"Unknown video_loss_type: {video_loss_type}")
 
     # use_amp = device.type == "cuda"
     use_amp = False
@@ -868,45 +825,58 @@ def train_joint_epoch(
 
         # ---------- VIDEO BATCH ----------
         try:
-            frames, vid_labels, keyframe_indices = next(video_iter)
+            frames, vid_labels, _ = next(video_iter)
         except StopIteration:
             video_iter = iter(video_loader)
-            frames, vid_labels, keyframe_indices = next(video_iter)
+            frames, vid_labels, _ = next(video_iter)
 
         frames = frames.to(device, non_blocking=True)
         vid_labels = vid_labels.to(device, non_blocking=True)
-        keyframe_indices = keyframe_indices.to(device)
 
         backbone_optimizer.zero_grad(set_to_none=True)
         video_head_optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            vid_logits, vid_features = video_model(
-                frames, keyframe_indices, return_features=True
-            )
+            vid_logits, vid_features = video_model(frames, return_features=True)
+
+            # Video-level classification loss
             vid_cls_loss = cls_criterion(vid_logits, vid_labels)
 
+            # Frame-level classification loss (Paper Section 3.1)
             batch_size, num_frames = frames.shape[0], frames.shape[1]
-            if aux_requires_labels and video_loss_type == "triplet_standard":
-                frame_labels = vid_labels.unsqueeze(1).expand(-1, num_frames)
+            frame_features = vid_features["frame_features"]  # (B, N, C, H, W)
+            _, _, C, H, W = frame_features.shape
+
+            # Pool and classify each frame
+            frame_pooled = video_model.global_pool(
+                frame_features.view(batch_size * num_frames, C, H, W)
+            ).view(batch_size * num_frames, -1)
+            frame_logits = video_model.classifier(frame_pooled)
+            frame_labels = vid_labels.unsqueeze(1).expand(-1, num_frames).reshape(-1)
+            frame_cls_loss = cls_criterion(frame_logits, frame_labels)
+
+            # Auxiliary loss
+            if video_loss_type == "coherence":
                 vid_aux_loss = video_aux_criterion(
-                    vid_features["frame_features"], frame_labels
+                    vid_features["frame_features"],
+                    vid_features["attention_weights"],
+                    center_loss_fn.centers,
+                    vid_labels,
                 )
-            else:
+            elif video_loss_type == "triplet_standard":
+                frame_labels_expanded = vid_labels.unsqueeze(1).expand(-1, num_frames)
                 vid_aux_loss = video_aux_criterion(
-                    vid_features["frame_features"], vid_features["keyframe_center"]
+                    vid_features["frame_features"], frame_labels_expanded
                 )
 
-            # Combined loss: classification + alpha * coherence/triplet loss
-            vid_loss = vid_cls_loss + alpha_video * vid_aux_loss
+            # Combined loss (Paper Eq. 4)
+            vid_loss = vid_cls_loss + frame_cls_loss + alpha_video * vid_aux_loss
 
         # Backward pass
         vid_scaler.scale(vid_loss).backward()
         vid_scaler.unscale_(video_head_optimizer)
         torch.nn.utils.clip_grad_norm_(
-            list(video_model.kga.parameters())
-            + list(video_model.kfc.parameters())
-            + list(video_model.temporal_agg.parameters())
+            list(video_model.frame_attention.parameters())
             + list(video_model.classifier.parameters())
             + list(video_model.backbone.parameters()),
             max_norm=1.0,
@@ -939,8 +909,8 @@ def train_joint_epoch(
             }
         )
 
-        # free memory
-        del images, img_labels, frames, vid_labels, keyframe_indices
+        # Free memory
+        del images, img_labels, frames, vid_labels, _
 
     return (
         total_image_loss / iters_done,  # average image loss
@@ -949,44 +919,6 @@ def train_joint_epoch(
         100.0 * video_correct / video_total,  # video accuracy
         iters_done,  # return iteration count
     )
-
-
-def validate(model, val_loader, device):
-    """Validate the model."""
-    model.eval()
-
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    criterion = nn.CrossEntropyLoss()
-
-    with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Validation")
-        for frames, labels, keyframe_indices in pbar:
-            frames = frames.to(device)
-            labels = labels.to(device)
-            keyframe_indices = keyframe_indices.to(device)
-
-            # Forward pass
-            logits = model(frames, keyframe_indices)
-            loss = criterion(logits, labels)
-
-            # Statistics
-            total_loss += loss.item()
-            _, predicted = logits.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-            # Update progress bar
-            pbar.set_postfix(
-                {"loss": f"{loss.item():.4f}", "acc": f"{100.*correct/total:.2f}%"}
-            )
-
-    avg_loss = total_loss / len(val_loader)
-    accuracy = 100.0 * correct / total
-
-    return avg_loss, accuracy
 
 
 def train_joint_kga_net(
@@ -1004,7 +936,7 @@ def train_joint_kga_net(
     video_lr=0.0001,
     alpha_center=0.5,
     alpha_video=0.5,
-    feature_dim=512,
+    feature_dim=2048,
     video_loss_type="triplet_standard",
     mining="hard",
     train_split=0.8,
@@ -1137,9 +1069,6 @@ def train_joint_kga_net(
     video_model = KGANet(
         num_classes=2,
         feature_dim=2048,
-        reduction=16,
-        aggregation_type="attention",
-        pretrained=False,
         backbone=shared_backbone,
     ).to(device)
 
@@ -1217,7 +1146,7 @@ def train_joint_kga_net(
     global_iter = 0
 
     for epoch in range(num_epochs):
-        if global_iter >= total_iter:
+        if global_iter > total_iter:
             break
 
         logger.info(f"\nEpoch {epoch+1}/{num_epochs} (Iter {global_iter}/{total_iter})")
@@ -1250,7 +1179,7 @@ def train_joint_kga_net(
         logger.info(f"Train - Image Loss: {img_loss:.4f}, Acc: {img_acc:.2f}%")
         logger.info(f"Train - Video Loss: {vid_loss:.4f}, Acc: {vid_acc:.2f}%")
 
-        # Validation
+        # ================= Validation =================
         image_model.eval()
         img_correct, img_total = 0, 0
         with torch.no_grad():
@@ -1268,6 +1197,18 @@ def train_joint_kga_net(
             f"Val   - Image Acc: {val_img_acc:.2f}%, Video Acc: {val_vid_acc:.2f}%"
         )
 
+        # Calculate optimal thresholds using Youden index
+        image_threshold = calculate_youden_threshold(
+            image_model, image_val_loader, device
+        )
+        video_threshold = calculate_youden_threshold(
+            video_model, video_val_loader, device
+        )
+
+        logger.info(
+            f"Optimal thresholds - Image: {image_threshold:.3f}, Video: {video_threshold:.3f}"
+        )
+
         # Save image and video model checkpoints after each 10 epochs
         if (epoch + 1) % 60 == 0:
             torch.save(
@@ -1276,6 +1217,7 @@ def train_joint_kga_net(
                     "backbone_state": shared_backbone.state_dict(),
                     "image_head": image_model.state_dict(),
                     "val_acc": val_img_acc,
+                    "threshold": image_threshold,
                 },
                 os.path.join(save_dir, f"image_model_epoch_{epoch+1}.pth"),
             )
@@ -1291,6 +1233,7 @@ def train_joint_kga_net(
                     "backbone_state": shared_backbone.state_dict(),
                     "video_head": video_model.state_dict(),
                     "val_acc": val_vid_acc,
+                    "threshold": video_threshold,
                 },
                 os.path.join(
                     save_dir, f"video_model_{vid_loss_type_str}_epoch_{epoch+1}.pth"
@@ -1307,6 +1250,7 @@ def train_joint_kga_net(
                     "backbone_state": shared_backbone.state_dict(),
                     "image_head": image_model.state_dict(),  # contains backbone entries too but same values
                     "val_acc": val_img_acc,
+                    "threshold": image_threshold,
                 },
                 os.path.join(save_dir, "best_image_model.pth"),
             )
@@ -1324,6 +1268,7 @@ def train_joint_kga_net(
                     "backbone_state": shared_backbone.state_dict(),
                     "video_head": video_model.state_dict(),
                     "val_acc": val_vid_acc,
+                    "threshold": video_threshold,
                 },
                 os.path.join(save_dir, f"best_video_model_{vid_loss_type_str}.pth"),
             )
@@ -1336,6 +1281,86 @@ def train_joint_kga_net(
     logger.info("=" * 70)
 
     return image_model, video_model
+
+
+def validate(model, val_loader, device):
+    """Validate the model."""
+    model.eval()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        pbar = tqdm(val_loader, desc="Validation")
+        for frames, labels, _ in pbar:  # Ignore keyframe_indices
+            frames = frames.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            logits = model(frames)
+            loss = criterion(logits, labels)
+
+            # Statistics
+            total_loss += loss.item()
+            _, predicted = logits.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+            # Update progress bar
+            pbar.set_postfix(
+                {"loss": f"{loss.item():.4f}", "acc": f"{100.*correct/total:.2f}%"}
+            )
+
+    avg_loss = total_loss / len(val_loader)
+    accuracy = 100.0 * correct / total
+
+    return avg_loss, accuracy
+
+
+def validate_with_threshold(model, val_loader, device):
+    """Validate using Youden's optimal threshold."""
+    model.eval()
+    # First pass: calculate optimal threshold
+    threshold = calculate_youden_threshold(model, val_loader, device)
+
+    # Second pass: evaluate with optimal threshold
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)[:, 1]
+            preds = (probs >= threshold).int()
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    # Calculate metrics
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    accuracy = (all_preds == all_labels).mean() * 100
+    tn = np.sum((all_preds == 0) & (all_labels == 0))
+    fp = np.sum((all_preds == 1) & (all_labels == 0))
+    fn = np.sum((all_preds == 0) & (all_labels == 1))
+    tp = np.sum((all_preds == 1) & (all_labels == 1))
+
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    return {
+        "threshold": threshold,
+        "accuracy": accuracy,
+        "sensitivity": sensitivity * 100,
+        "specificity": specificity * 100,
+    }
 
 
 # ============================================================================
@@ -1365,7 +1390,6 @@ if __name__ == "__main__":
     # Options: 'coherence', 'triplet_coherence', 'triplet_standard'
     LOSS_TYPE = "coherence"
     MINING = None  # 'hard', 'semi-hard', or 'all' (only for triplet_standard)
-    ALPHA = 0.5  # Weight for auxiliary loss
     ALPHA_CENTER = 0.5  # Weight for center loss
 
     # Path to save Checkpoints
@@ -1383,46 +1407,44 @@ if __name__ == "__main__":
     #     # ("triplet_standard", "semi-hard"),
     #     # ("triplet_standard", "all"),
     # ]:
-    for ALPHA in [0.2, 0.5, 0.8]:
-        for NUM_FRAMES in [8, 16, 32]:
-            logger.info("\n" + "=" * 70)
-            logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
-            logger.info(f"Image Batch Size: {IMAGE_BATCH_SIZE}")
-            logger.info(f"Number of Frames: {NUM_FRAMES}")
-            logger.info(f"Learning Rate: {LEARNING_RATE}")
-            logger.info(f"Alpha (Auxiliary Loss Weight): {ALPHA}")
-            logger.info(f"Alpha Center (Center Loss Weight): {ALPHA_CENTER}")
-            logger.info(f"Total Iterations:{TOTAL_ITERATIONS}")
+    for NUM_FRAMES in [8, 16]:  # skipping 32 as gpu is giving out of memory error
+        # for NUM_FRAMES in [32]:
+        logger.info("\n" + "=" * 70)
+        logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
+        logger.info(f"Image Batch Size: {IMAGE_BATCH_SIZE}")
+        logger.info(f"Number of Frames: {NUM_FRAMES}")
+        logger.info(f"Learning Rate: {LEARNING_RATE}")
+        logger.info(f"Alpha Center (Center Loss Weight): {ALPHA_CENTER}")
+        logger.info(f"Total Iterations:{TOTAL_ITERATIONS}")
 
-            if LOSS_TYPE != "triplet_standard":
-                logger.info(f"\nStarting training with loss type: {LOSS_TYPE}")
-            else:
-                logger.info(
-                    f"\nStarting training with loss type: {LOSS_TYPE}, Mining: {MINING}"
-                )
-            print("=" * 70)
-
-            image_model, video_model = train_joint_kga_net(
-                # Image dataset
-                image_root_dir=IMAGE_ROOT_DIR,
-                image_annotation_file=IMAGE_ANNOTATION,
-                # Video dataset
-                video_root_dir=VIDEO_ROOT_DIR,
-                video_train_annotation=VIDEO_TRAIN_ANNOTATION,
-                video_val_annotation=VIDEO_VAL_ANNOTATION,
-                # Config
-                total_iter=TOTAL_ITERATIONS,
-                video_loss_type=LOSS_TYPE,
-                mining=MINING,
-                alpha_video=ALPHA,
-                alpha_center=ALPHA_CENTER,
-                video_lr=LEARNING_RATE,
-                image_lr=LEARNING_RATE,
-                image_batch_size=IMAGE_BATCH_SIZE,
-                video_batch_size=VIDEO_BATCH_SIZE,
-                num_frames=NUM_FRAMES,
-                save_dir=SAVE_DIR,
+        if LOSS_TYPE != "triplet_standard":
+            logger.info(f"\nStarting training with loss type: {LOSS_TYPE}")
+        else:
+            logger.info(
+                f"\nStarting training with loss type: {LOSS_TYPE}, Mining: {MINING}"
             )
+        print("=" * 70)
+
+        image_model, video_model = train_joint_kga_net(
+            # Image dataset
+            image_root_dir=IMAGE_ROOT_DIR,
+            image_annotation_file=IMAGE_ANNOTATION,
+            # Video dataset
+            video_root_dir=VIDEO_ROOT_DIR,
+            video_train_annotation=VIDEO_TRAIN_ANNOTATION,
+            video_val_annotation=VIDEO_VAL_ANNOTATION,
+            # Config
+            total_iter=TOTAL_ITERATIONS,
+            video_loss_type=LOSS_TYPE,
+            mining=MINING,
+            alpha_center=ALPHA_CENTER,
+            video_lr=LEARNING_RATE,
+            image_lr=LEARNING_RATE,
+            image_batch_size=IMAGE_BATCH_SIZE,
+            video_batch_size=VIDEO_BATCH_SIZE,
+            num_frames=NUM_FRAMES,
+            save_dir=SAVE_DIR,
+        )
 
     print("\n✓ Training completed successfully!")
     print(f"✓ Model checkpoints saved in: {SAVE_DIR}/")

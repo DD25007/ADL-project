@@ -229,6 +229,91 @@ self.feature_layer = nn.Sequential(
 )
 ```
 
+For
+> * Loss = coherence
+> * alpha center = 0.5
+> * NUM_FRAMES = 32
+
+Try all combinations of alpha = [0.2, 0.5, 0.8] and NUM_FRAMES = [8, 16, 32]
+
+### alpha = 0.2 and NUM_FRAMES = 8
+
+* Train - Image Loss: 0.2126, Acc: 100.00%
+* Train - Video Loss: 0.0155, Acc: 100.00%
+* Val   - Image Acc: 87.69%, Video Acc: 51.35%
+* **Best Image Acc**: 92.31%
+* **Best Video Acc**: 70.27%
 
 
+### alpha = 0.2 and NUM_FRAMES = 16
+
+* Train - Image Loss: 0.2878, Acc: 97.37%
+* Train - Video Loss: 0.1058, Acc: 96.64%
+* Val   - Image Acc: 87.69%, Video Acc: 62.16%
+* **Best Image Acc**: 93.08%
+* **Best Video Acc**: 75.68%
+
+### alpha = 0.2 and NUM_FRAMES = 32
+
+* Train - Image Loss: 0.2132, Acc: 100.00%
+* Train - Video Loss: 0.0146, Acc: 100.00%
+* Val   - Image Acc: 91.54%, Video Acc: 56.76%
+* **Best Image Acc**: 93.85%
+* **Best Video Acc**: 70.27%
+
+
+## Experiment 5
+Changes Made:
+* Fixed cohrence loss implementation
+* Added frame attention weights in KGA-net
+
+Try all combinations of alpha = [0.2, 0.5, 0.8] and NUM_FRAMES = [8, 16, 32]
+
+### alpha = 0.2 and NUM_FRAMES = 8
+
+* Train - Image Loss: 0.5851, Acc: 62.50%
+* Train - Video Loss: 1.4161, Acc: 62.50%
+* Val   - Image Acc: 74.62%, Video Acc: 54.05%
+* **Best Image Acc**: 74.62%
+* **Best Video Acc**: 75.68%
+
+### alpha = 0.2 and NUM_FRAMES = 16
+
+* Train - Image Loss: 0.3913, Acc: 87.50%
+* Train - Video Loss: 1.3998, Acc: 62.50%
+* Val   - Image Acc: 86.15%, Video Acc: 72.97%
+* **Best Image Acc**: 88.46%
+* **Best Video Acc**: 75.68%
+
+### alpha = 0.5 and NUM_FRAMES = 8
+
+* Train - Image Loss: 0.6655, Acc: 62.50%
+* Train - Video Loss: 1.4883, Acc: 50.00%
+* Val   - Image Acc: 72.31%, Video Acc: 62.16%
+* **Best Image Acc**: 73.08%
+* **Best Video Acc**: 78.38%
+
+### alpha = 0.5 and NUM_FRAMES = 16
+
+* Train - Image Loss: 0.6654, Acc: 62.50%
+* Train - Video Loss: 1.4895, Acc: 37.50%
+* Val   - Image Acc: 72.31%, Video Acc: 70.27%
+* **Best Image Acc**: 72.31%
+* **Best Video Acc**: 78.38%
+
+### alpha = 0.8 and NUM_FRAMES = 8
+
+* Train - Image Loss: 0.6651, Acc: 62.50%
+* Train - Video Loss: 1.5221, Acc: 50.00%
+* Val   - Image Acc: 72.31%, Video Acc: 56.76%
+* **Best Image Acc**: 72.31%
+* **Best Video Acc**: 72.97%
+
+### alpha = 0.8 and NUM_FRAMES = 16
+
+* Train - Image Loss: 0.6639, Acc: 62.50%
+* Train - Video Loss: 1.5905, Acc: 37.50%
+* Val   - Image Acc: 72.31%, Video Acc: 59.46%
+* **Best Image Acc**: 72.31%
+* **Best Video Acc**: 72.97%
 
