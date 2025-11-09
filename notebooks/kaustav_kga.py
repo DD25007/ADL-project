@@ -1098,8 +1098,6 @@ def train_joint_kga_net(
 
     # ==================== TRAINING LOOP ====================
     logger.info(f"\nStarting joint training...")
-    logger.info(f"Alpha (Center Loss Weight): {alpha_center}")
-    logger.info(f"Lambda (Coherence Loss Weight): {lambda_coh}")
 
     best_img_acc = 0.0
     best_vid_acc = 0.0
@@ -1169,7 +1167,7 @@ def train_joint_kga_net(
         )
 
         # Save checkpoints periodically
-        if (epoch + 1) % 60 == 0:
+        if (epoch + 1) % 84 == 0:
             torch.save(
                 {
                     "epoch": epoch,
@@ -1335,7 +1333,7 @@ if __name__ == "__main__":
     # Training configuration
     IMAGE_BATCH_SIZE = 8
     VIDEO_BATCH_SIZE = 8
-    NUM_FRAMES = 32
+    NUM_FRAMES = 16
 
     # Loss configuration
     # Options: 'coherence', 'triplet_coherence', 'triplet_standard'
@@ -1351,42 +1349,43 @@ if __name__ == "__main__":
     print("=" * 70)
     # for LOSS_TYPE, MINING in [
     #     ("coherence", None),
-    #     # ("triplet_standard", "hard"),
-    #     # ("triplet_standard", "semi-hard"),
-    #     # ("triplet_standard", "all"),
+    #     ("triplet_standard", "hard"),
+    #     ("triplet_standard", "semi-hard"),
+    #     ("triplet_standard", "all"),
     # ]:
-    for NUM_FRAMES in [8, 16]:  # skipping 32 as gpu is giving out of memory error
-        # for NUM_FRAMES in [32]:
-        logger.info("\n" + "=" * 70)
-        logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
-        logger.info(f"Image Batch Size: {IMAGE_BATCH_SIZE}")
-        logger.info(f"Number of Frames: {NUM_FRAMES}")
-        logger.info(f"Alpha Center (Center Loss Weight): {ALPHA_CENTER}")
+    for ALPHA_CENTER in [0.1, 0.5, 1.0]:
+        for NUM_FRAMES in [8, 16]:  # skipping 32 as gpu is giving out of memory error
+            # for NUM_FRAMES in [32]:
+            logger.info("\n" + "=" * 70)
+            logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
+            logger.info(f"Image Batch Size: {IMAGE_BATCH_SIZE}")
+            logger.info(f"Number of Frames: {NUM_FRAMES}")
+            logger.info(f"Alpha Center (Center Loss Weight): {ALPHA_CENTER}")
 
-        if LOSS_TYPE != "triplet_standard":
-            logger.info(f"\nStarting training with loss type: {LOSS_TYPE}")
-        else:
-            logger.info(
-                f"\nStarting training with loss type: {LOSS_TYPE}, Mining: {MINING}"
+            if LOSS_TYPE != "triplet_standard":
+                logger.info(f"\nStarting training with loss type: {LOSS_TYPE}")
+            else:
+                logger.info(
+                    f"\nStarting training with loss type: {LOSS_TYPE}, Mining: {MINING}"
+                )
+            print("=" * 70)
+            image_model, video_model = train_joint_kga_net(
+                # Image dataset
+                image_root_dir=IMAGE_ROOT_DIR,
+                image_annotation_file=IMAGE_ANNOTATION,
+                # Video dataset
+                video_root_dir=VIDEO_ROOT_DIR,
+                video_train_annotation=VIDEO_TRAIN_ANNOTATION,
+                video_val_annotation=VIDEO_VAL_ANNOTATION,
+                # Config
+                video_loss_type=LOSS_TYPE,
+                mining=MINING,
+                alpha_center=ALPHA_CENTER,
+                image_batch_size=IMAGE_BATCH_SIZE,
+                video_batch_size=VIDEO_BATCH_SIZE,
+                num_frames=NUM_FRAMES,
+                save_dir=SAVE_DIR,
             )
-        print("=" * 70)
-        image_model, video_model = train_joint_kga_net(
-            # Image dataset
-            image_root_dir=IMAGE_ROOT_DIR,
-            image_annotation_file=IMAGE_ANNOTATION,
-            # Video dataset
-            video_root_dir=VIDEO_ROOT_DIR,
-            video_train_annotation=VIDEO_TRAIN_ANNOTATION,
-            video_val_annotation=VIDEO_VAL_ANNOTATION,
-            # Config
-            video_loss_type=LOSS_TYPE,
-            mining=MINING,
-            alpha_center=ALPHA_CENTER,
-            image_batch_size=IMAGE_BATCH_SIZE,
-            video_batch_size=VIDEO_BATCH_SIZE,
-            num_frames=NUM_FRAMES,
-            save_dir=SAVE_DIR,
-        )
 
     print("\n✓ Training completed successfully!")
     print(f"✓ Model checkpoints saved in: {SAVE_DIR}/")

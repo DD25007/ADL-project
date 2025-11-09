@@ -317,3 +317,75 @@ Try all combinations of alpha = [0.2, 0.5, 0.8] and NUM_FRAMES = [8, 16, 32]
 * **Best Image Acc**: 72.31%
 * **Best Video Acc**: 72.97%
 
+
+
+## Experiment 6
+
+Changes Made:
+1. Changed Image model to 2048 from 512 dimension
+2. Added Youden index based optimal thresholding after each validation epoch 
+
+Fixed Params:
+* alhpa_video = 1
+* lr = 0.005
+
+Try all combinations of alpha_center = [0.1, 0.5, 1] and NUM_FRAMES = [8, 16]
+
+### alpha_center = 0.1 and NUM_FRAMES = 8
+Last Epoch Results:
+- Train - Image Loss: 0.0221, Acc: 100.00%
+- Train - Video Loss: 0.0211, Acc: 100.00%
+- Val   - Image Acc: 73.85%, Video Acc: 54.05%
+- Optimal thresholds - Image: 0.988, Video: 0.000
+- Best Image Acc: 83.85%
+- Best Video Acc: 70.27%
+
+### alpha_center = 0.1 and NUM_FRAMES = 16
+
+Last Epoch Results:
+- Train - Image Loss: 0.0225, Acc: 100.00%
+- Train - Video Loss: 0.0241, Acc: 100.00%
+- Val   - Image Acc: 81.54%, Video Acc: 54.05%
+- Optimal thresholds - Image: 0.863, Video: 0.000
+- Best Image Acc: 89.23%
+- Best Video Acc: 72.97%
+
+### alpha_center = 0.5 and NUM_FRAMES = 8
+
+Last Epoch Results:
+- Train - Image Loss: 0.0707, Acc: 100.00%
+- Train - Video Loss: 1.5196, Acc: 37.50%
+- Val   - Image Acc: 27.69%, Video Acc: 64.86%
+- Optimal thresholds - Image: 0.869, Video: 0.589
+- Best Image Acc: 83.85%
+- Best Video Acc: 67.57%
+
+### alpha_center = 0.5 and NUM_FRAMES = 16
+
+Last Epoch Results:
+- Train - Image Loss: 0.0571, Acc: 100.00%
+- INFO - Train - Video Loss: 0.0215, Acc: 100.00%
+- INFO - Val   - Image Acc: 89.23%, Video Acc: 51.35%
+- INFO - Optimal thresholds - Image: 0.491, Video: 1.000
+- INFO - Best Image Acc: 92.31%
+- INFO - Best Video Acc: 70.27%
+
+### alpha_center = 1 and NUM_FRAMES = 8
+
+Last Epoch Results:
+- Train - Image Loss: 0.1377, Acc: 100.00%
+- Train - Video Loss: 0.0225, Acc: 100.00%
+- Val   - Image Acc: 90.00%, Video Acc: 56.76%
+- Optimal thresholds - Image: 0.454, Video: 1.000
+- Best Image Acc: 93.08%
+- Best Video Acc: 70.27%
+
+### alpha_center = 1 and NUM_FRAMES = 16
+
+Last Epoch Results:
+- Train - Image Loss: 0.6677, Acc: 62.50%
+- Train - Video Loss: 1.5292, Acc: 37.50%
+- Val   - Image Acc: 72.31%, Video Acc: 64.86%
+- Optimal thresholds - Image: 0.336, Video: 0.584
+- Best Image Acc: 74.62%
+- Best Video Acc: 67.57%
