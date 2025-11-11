@@ -16,7 +16,7 @@ import logging
 # set random seed for reproducibility
 torch.manual_seed(42)
 
-training_file = "training.log"
+training_file = "mk.log"
 
 if os.path.exists(training_file):
     os.remove(training_file)

@@ -389,3 +389,149 @@ Last Epoch Results:
 - Optimal thresholds - Image: 0.336, Video: 0.584
 - Best Image Acc: 74.62%
 - Best Video Acc: 67.57%
+
+## Experiment 7
+
+Changes Made:
+1. Merged image, backbone and video model optimizers into a single optimizer
+2. Merged image and video model schedulers into a single scheduler
+3. Changed image split from 80-20 to 100-0 train-val split. The same train set is used for validation during training.
+4. Added early stopping with patience of 15 epochs based on validation video accuracy
+
+Fixed Params:
+* alpha_center = 0.5
+* lr = 0.005
+
+Try all combinations of NUM_FRAMES = [8, 16, 32] and LOSS_TYPE = [coherence, triplet(hard), triplet(semi-hard), triplet(all)]
+
+### NUM_FRAMES = 8 and LOSS_TYPE = coherence
+
+Epoch 24/422 (Iter 437/8000)
+- Train - Image Loss: 12.6851, Acc: 52.63%
+- Train - Video Loss: 1.4597, Acc: 59.73%
+- Val   - Image Acc: 63.06% (train set), Video Acc: 64.86%
+- Optimal thresholds - Image: 0.479, Video: 1.000
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 63.06%
+- Best Video Acc: 72.97%
+
+### NUM_FRAMES = 16 and LOSS_TYPE = coherence
+
+Epoch 23/422 (Iter 418/8000)
+- Train - Image Loss: 12.0213, Acc: 57.89%
+- Train - Video Loss: 1.4359, Acc: 61.07%
+- Val   - Image Acc: 60.43% (train set), Video Acc: 48.65%
+- Optimal thresholds - Image: 0.466, Video: 0.868
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 65.53%
+- Best Video Acc: 75.68%
+
+### NUM_FRAMES = 32 and LOSS_TYPE = coherence
+
+Epoch 19/422 (Iter 342/8000)
+- Train - Image Loss: 12.3321, Acc: 55.92%
+- Train - Video Loss: 1.4998, Acc: 63.76%
+- Val   - Image Acc: 62.91% (train set), Video Acc: 59.46%
+- Optimal thresholds - Image: 0.515, Video: 0.999
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 65.07%
+- Best Video Acc: 64.86%
+
+### NUM_FRAMES = 8 and LOSS_TYPE = triplet(hard)
+
+Epoch 38/422 (Iter 703/8000)
+- Train - Image Loss: 12.5704, Acc: 59.21%
+- Train - Video Loss: 5.0745, Acc: 59.06%
+- Val   - Image Acc: 66.15% (train set), Video Acc: 64.86%
+- Optimal thresholds - Image: 0.480, Video: 1.000
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 67.39%
+- Best Video Acc: 64.86%
+
+### NUM_FRAMES = 16 and LOSS_TYPE = triplet(hard)
+
+Epoch 30/422 (Iter 551/8000)
+- Train - Image Loss: 12.6908, Acc: 52.63%
+- Train - Video Loss: 5.8162, Acc: 60.40%
+- Val   - Image Acc: 57.34% (train set), Video Acc: 64.86%
+- Optimal thresholds - Image: 0.535, Video: 1.000
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 57.65%
+- Best Video Acc: 67.57%
+
+### NUM_FRAMES = 32 and LOSS_TYPE = triplet(hard)
+
+Epoch 43/422 (Iter 798/8000)
+- Train - Image Loss: 12.2084, Acc: 57.89%
+- Train - Video Loss: 5.8135, Acc: 59.73%
+- Val   - Image Acc: 57.19% (train set), Video Acc: 51.35%
+- Optimal thresholds - Image: 0.505, Video: 0.990
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 63.21%
+- Best Video Acc: 70.27%
+
+### NUM_FRAMES = 8 and LOSS_TYPE = triplet(semi-hard)
+
+Epoch 32/422 (Iter 589/8000)
+- Train - Image Loss: 12.9334, Acc: 53.95%
+- Train - Video Loss: 1.8724, Acc: 59.06%
+- Val   - Image Acc: 44.51% (train set), Video Acc: 64.86%
+- Optimal thresholds - Image: 0.541, Video: 1.000
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 49.92%
+- Best Video Acc: 67.57%
+
+### NUM_FRAMES = 16 and LOSS_TYPE = triplet(semi-hard)
+
+Epoch 26/422 (Iter 475/8000)
+- Train - Image Loss: 12.4789, Acc: 43.42%
+- Train - Video Loss: 1.8371, Acc: 61.07%
+- Val   - Image Acc: 38.95% (train set), Video Acc: 62.16%
+- Optimal thresholds - Image: 0.548, Video: 0.997
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 41.11%
+- Best Video Acc: 62.16%
+
+### NUM_FRAMES = 32 and LOSS_TYPE = triplet(semi-hard)
+
+Epoch 22/422 (Iter 399/8000)
+- Train - Image Loss: 12.5903, Acc: 47.37%
+- Train - Video Loss: 1.8735, Acc: 66.44%
+- Val   - Image Acc: 53.01% (train set), Video Acc: 43.24%
+- Optimal thresholds - Image: 0.493, Video: 0.901
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 62.29%
+- Best Video Acc: 59.46%
+
+### NUM_FRAMES = 8 and LOSS_TYPE = triplet(all)
+
+Epoch 32/422 (Iter 589/8000)
+- Train - Image Loss: 12.7354, Acc: 59.87%
+- Train - Video Loss: 2.3503, Acc: 61.07%
+- Val   - Image Acc: 53.94% (train set), Video Acc: 64.86%
+- Optimal thresholds - Image: 0.483, Video: 1.000
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 53.17%
+- Best Video Acc: 64.86%
+
+### NUM_FRAMES = 16 and LOSS_TYPE = triplet(all)
+
+Epoch 17/422 (Iter 304/8000)
+- Train - Image Loss: 12.3755, Acc: 51.32%
+- Train - Video Loss: 2.3314, Acc: 57.72%
+- Val   - Image Acc: 59.20% (train set), Video Acc: 67.57%
+- Optimal thresholds - Image: 0.519, Video: 0.991
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 64.45%
+- Best Video Acc: 70.27%
+
+### NUM_FRAMES = 32 and LOSS_TYPE = triplet(all)
+
+Epoch 27/422 (Iter 494/8000)
+- Train - Image Loss: 12.2079, Acc: 63.82%
+- Train - Video Loss: 2.3484, Acc: 61.74%
+- Val   - Image Acc: 59.97% (train set), Video Acc: 62.16%
+- Optimal thresholds - Image: 0.499, Video: 0.548
+- Early stopping triggered after 15 epochs without improvement
+- Best Image Acc: 59.81%
+- Best Video Acc: 67.57%
