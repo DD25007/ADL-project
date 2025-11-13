@@ -12,21 +12,136 @@ import torchvision.transforms as transforms
 from sklearn.metrics import roc_curve
 from tqdm import tqdm
 import logging
+import subprocess
 
 # set random seed for reproducibility
 torch.manual_seed(42)
 
 training_file = "training.log"
 
-if os.path.exists(training_file):
-    os.remove(training_file)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(training_file), logging.StreamHandler()],
-)
+# Custom handler class that flushes after every write
+class FlushingFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+def setup_logger(log_file="training.log", clear_existing=False):
+    """Setup logger with file and console handlers.
+
+    Args:
+        log_file: Path to log file
+        clear_existing: If True, delete existing log file before starting
+    """
+    # Clear existing log file if requested
+    if clear_existing and os.path.exists(log_file):
+        os.remove(log_file)
+
+    # Setup logging with flushing handler
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
+    # Clear any existing handlers
+    logger.handlers.clear()
+
+    # File handler with automatic flushing
+    file_handler = FlushingFileHandler(log_file, mode="a")  # Changed to append mode
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+# Create logger instance (will be properly initialized in main)
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# GPU SELECTION UTILITY
+# ============================================================================
+
+
+def get_least_used_gpu():
+    """Find the GPU with the lowest memory utilization percentage.
+
+    Returns:
+        int: GPU ID with lowest memory utilization, or 0 if detection fails
+    """
+    try:
+        # Run nvidia-smi to get memory usage (used and total)
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # Parse output and calculate free memory
+        gpu_info = []
+        for line in result.stdout.strip().split("\n"):
+            gpu_id, memory_used, memory_total = line.split(",")
+            gpu_id = int(gpu_id.strip())
+            memory_used = float(memory_used.strip())
+            memory_total = float(memory_total.strip())
+            memory_free = memory_total - memory_used
+            gpu_info.append((gpu_id, memory_used, memory_total, memory_free))
+
+        # Find GPU with maximum free memory
+        best_gpu = max(gpu_info, key=lambda x: x[3])
+
+        return best_gpu[0]
+
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+        logger.warning(f"Failed to detect GPU usage: {e}")
+        logger.warning("Falling back to GPU 0")
+        return 0
+
+
+def select_best_device():
+    """Select the best available device (GPU with lowest memory or CPU).
+
+    Returns:
+        torch.device: The selected device
+    """
+    if not torch.cuda.is_available():
+        logger.info("CUDA not available, using CPU")
+        return torch.device("cpu")
+
+    gpu_id = get_least_used_gpu()
+    device = torch.device(f"cuda:{gpu_id}")
+
+    # Verify the device is accessible
+    try:
+        torch.cuda.set_device(device)
+        _ = torch.zeros(1).to(device)
+        logger.info(f"✓ Successfully initialized {device}")
+        return device
+    except Exception as e:
+        logger.warning(f"Failed to initialize cuda:{gpu_id}: {e}")
+        logger.warning("Falling back to cuda:0")
+        return torch.device("cuda:0")
+
+
+# ============================================================================
+# DATASET CLASSES AND DATALOADERS
+# ============================================================================
 
 
 class BUSIImageDataset(Dataset):
@@ -374,23 +489,57 @@ class FrameAttention(nn.Module):
 
 class CenterLoss(nn.Module):
     """Center Loss for discriminative feature learning.
-    Args:
-        num_classes: Number of classes
-        feature_dim: Dimension of feature vectors
-        device: Device to store the centers
+    Matches Wen et al. (paper): loss = 1/2 sum ||x_i - c_{y_i}||^2
+    Centers are updated with the paper's equation (no gradient descent).
     """
 
     def __init__(self, num_classes, feature_dim, device="cuda"):
         super(CenterLoss, self).__init__()
         self.num_classes = num_classes
         self.feature_dim = feature_dim
-        self.centers = nn.Parameter(torch.randn(num_classes, feature_dim).to(device))
+        self.device = torch.device(device)
+        # Use buffer so centers are not updated by optimizer / autograd
+        centers = torch.zeros(num_classes, feature_dim, device=self.device)
+        self.register_buffer("centers", centers)
 
     def forward(self, features, labels):
+        """
+        features: (B, D) feature vectors (pooled)
+        labels: (B,)
+        returns scalar loss (averaged over batch)
+        """
         batch_size = features.size(0)
-        centers_batch = self.centers[labels]
+        centers_batch = self.centers[labels]  # (B, D)
         loss = torch.sum((features - centers_batch) ** 2) / (2.0 * batch_size)
         return loss
+
+    @torch.no_grad()
+    def update_centers(self, features, labels, alpha):
+        """
+        Update centers using Wen et al. Eq.4:
+            Δc_j = sum_{i: y_i=j} (c_j - x_i) / (1 + count_j)
+            c_j <- c_j - alpha * Δc_j
+
+        features: (B, D) tensor (should be detached)
+        labels: (B,) tensor
+        alpha: scalar learning rate for centers
+        """
+        device = self.centers.device
+        features = features.to(device)
+        labels = labels.to(device)
+
+        unique_labels = labels.unique()
+        for lbl in unique_labels:
+            mask = labels == lbl
+            count = mask.sum().item()
+            if count == 0:
+                continue
+            features_j = features[mask]  # (count, D)
+            c_j = self.centers[lbl]  # (D,)
+            # Δc_j = sum (c_j - x_i) / (1 + count)
+            diff = (c_j.unsqueeze(0) - features_j).sum(dim=0) / (1.0 + count)
+            # update
+            self.centers[lbl] = c_j - alpha * diff
 
 
 class CoherenceLoss(nn.Module):
@@ -703,7 +852,7 @@ def train_joint_epoch(
     image_loader,
     video_loader,
     main_optimizer,
-    center_optimizer,
+    # center_optimizer,
     device,
     center_loss_fn,
     main_scheduler,
@@ -736,7 +885,7 @@ def train_joint_epoch(
     else:
         raise ValueError(f"Unknown video_loss_type: {video_loss_type}")
 
-    # use_amp = device.type == "cuda"
+    # Setting mixed precision to False coz loss becomes infinite sometimes
     use_amp = False
     img_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     vid_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -766,31 +915,43 @@ def train_joint_epoch(
 
         # zero grads
         main_optimizer.zero_grad(set_to_none=True)
-        center_optimizer.zero_grad(set_to_none=True)
+        # center_optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             img_logits, img_features = image_model(images, return_features=True)
             img_cls_loss = cls_criterion(img_logits, img_labels)
             img_center_loss = center_loss_fn(img_features, img_labels)
-            # Paper Eq. 4 component: L^I_CE + L_Center
+
+            # Clamp center loss to prevent explosion
+            img_center_loss = torch.clamp(img_center_loss, max=10.0)
+
+            # Paper Eq. 4 component: L^I_CE + alpha * L_Center
             img_loss = img_cls_loss + alpha_center * img_center_loss
 
         img_scaler.scale(img_loss).backward()
         img_scaler.unscale_(main_optimizer)
+        # img_scaler.unscale_(center_optimizer)
+
+        # Clip gradients
         torch.nn.utils.clip_grad_norm_(
             list(image_model.parameters()) + list(video_model.parameters()),
             max_norm=1.0,
         )
+        torch.nn.utils.clip_grad_norm_(
+            list(center_loss_fn.parameters()),
+            max_norm=10.0,  # Allow larger gradients for centers
+        )
 
-        # Step main optimizer and center optimizer
+        # Step both optimizers
         img_scaler.step(main_optimizer)
-
-        # Update centers with scaled gradient
-        for param in center_loss_fn.parameters():
-            if param.grad is not None:
-                param.grad.data *= 1.0 / alpha_center
-        img_scaler.step(center_optimizer)
+        # img_scaler.step(center_optimizer)
         img_scaler.update()
+
+        # Update centers per-paper (use detached features)
+        # img_features is the pooled 2048-d vector returned by ImageClassificationNetwork
+        center_loss_fn.update_centers(
+            img_features.detach(), img_labels.detach(), alpha_center
+        )
 
         total_image_loss += img_loss.item()
         _, img_pred = img_logits.max(1)
@@ -847,6 +1008,21 @@ def train_joint_epoch(
             # Paper Eq. 4: L^V_CE + λ · L_Coh, where λ=1
             # Plus frame-level loss mentioned in Section 3.1
             vid_loss = vid_cls_loss + frame_cls_loss + lambda_coh * vid_aux_loss
+
+            # Log detailed loss breakdown for debugging
+            if (iters_done + 1) % 50 == 0:
+                # Get loss components from last batch
+                with torch.no_grad():
+                    logger.info(
+                        f"   Image CE: {img_cls_loss:.4f}, Center: {img_center_loss:.4f}, Current LR: {main_scheduler.get_last_lr()[0]:.6f}"
+                    )
+                    center_norm = center_loss_fn.centers.norm(dim=1)
+                    center_dist = torch.dist(
+                        center_loss_fn.centers[0], center_loss_fn.centers[1]
+                    )
+                    logger.info(
+                        f"   Center norms: [{center_norm[0]:.2f}, {center_norm[1]:.2f}], Distance: {center_dist:.2f}"
+                    )
 
         # Backward pass
         vid_scaler.scale(vid_loss).backward()
@@ -909,10 +1085,10 @@ def train_joint_kga_net(
     num_workers=4,
     early_stopping=True,
     patience=15,
+    device="cpu",
 ):
     """Train image and video models jointly."""
     os.makedirs(save_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
     # ==================== CREATE IMAGE DATALOADERS ====================
@@ -1017,11 +1193,18 @@ def train_joint_kga_net(
         weight_decay=1e-4,
     )
 
-    # Center optimizer - separate with higher LR
-    center_optimizer = torch.optim.SGD(
-        center_loss_fn.parameters(),
-        lr=0.5,
-    )
+    # Center optimizer - uses higher LR but scaled with alpha_center
+    # Standard center loss practice: lr inversely proportional to alpha
+    # REMOVED: center_optimizer is not needed
+    # Centers are updated manually via center_loss_fn.update_centers()
+    # which implements the paper's Eq. 4 closed-form rule
+
+    # center_optimizer = torch.optim.SGD(
+    #     center_loss_fn.parameters(),
+    #     lr=0.5
+    #     / alpha_center,  # Inverse scale: if alpha↑, centers already get strong gradients
+    #     momentum=0.9,
+    # )
 
     # ==================== SCHEDULERS ====================
     iterations_per_epoch = min(len(image_train_loader), len(video_train_loader))
@@ -1066,7 +1249,7 @@ def train_joint_kga_net(
             image_train_loader,
             video_train_loader,
             main_optimizer,
-            center_optimizer,
+            # center_optimizer,
             device,
             center_loss_fn,
             main_scheduler,
@@ -1259,6 +1442,10 @@ def validate_with_threshold(model, val_loader, device):
 # ============================================================================
 
 if __name__ == "__main__":
+
+    # Initialize logger ONCE at the start of training
+    logger = setup_logger(training_file, clear_existing=True)
+
     # Dataset configuration
     IMAGE_ROOT_DIR = "./data/busi/"
     IMAGE_ANNOTATION = "data/busi_bboxes.json"
@@ -1294,8 +1481,12 @@ if __name__ == "__main__":
         for NUM_FRAMES in [
             8,
             16,
-            32,
+            # 32,
+            # 64,
         ]:
+            # Select best GPU before each training run
+            device = select_best_device()
+
             logger.info("\n" + "=" * 70)
             logger.info("Training Configuration:")
             logger.info(f"Video Batch Size: {VIDEO_BATCH_SIZE}")
@@ -1309,26 +1500,31 @@ if __name__ == "__main__":
                 logger.info(f"Loss Type: {LOSS_TYPE}")
             logger.info("=" * 70)
 
-            image_model, video_model = train_joint_kga_net(
-                # Image dataset
-                image_root_dir=IMAGE_ROOT_DIR,
-                image_annotation_file=IMAGE_ANNOTATION,
-                # Video dataset
-                video_root_dir=VIDEO_ROOT_DIR,
-                video_train_annotation=VIDEO_TRAIN_ANNOTATION,
-                video_val_annotation=VIDEO_VAL_ANNOTATION,
-                # Config (Paper's values)
-                video_loss_type=LOSS_TYPE,
-                mining=MINING,
-                alpha_center=ALPHA_CENTER,
-                learning_rate=LEARNING_RATE,
-                image_batch_size=IMAGE_BATCH_SIZE,
-                video_batch_size=VIDEO_BATCH_SIZE,
-                num_frames=NUM_FRAMES,
-                save_dir=SAVE_DIR,
-                early_stopping=False,  # Enable for small datasets
-                # patience=30,
-            )
+            try:
+                image_model, video_model = train_joint_kga_net(
+                    # Image dataset
+                    image_root_dir=IMAGE_ROOT_DIR,
+                    image_annotation_file=IMAGE_ANNOTATION,
+                    # Video dataset
+                    video_root_dir=VIDEO_ROOT_DIR,
+                    video_train_annotation=VIDEO_TRAIN_ANNOTATION,
+                    video_val_annotation=VIDEO_VAL_ANNOTATION,
+                    # Config
+                    video_loss_type=LOSS_TYPE,
+                    mining=MINING,
+                    alpha_center=ALPHA_CENTER,
+                    learning_rate=LEARNING_RATE,
+                    image_batch_size=IMAGE_BATCH_SIZE,
+                    video_batch_size=VIDEO_BATCH_SIZE,
+                    num_frames=NUM_FRAMES,
+                    save_dir=SAVE_DIR,
+                    early_stopping=True,
+                    patience=15,
+                    device=device,
+                )
+            except Exception as e:
+                logger.error(f"Training failed with error: {e}", exc_info=True)
+                continue
 
     print("\n✓ Training completed successfully!")
     print(f"✓ Model checkpoints saved in: {SAVE_DIR}/")
