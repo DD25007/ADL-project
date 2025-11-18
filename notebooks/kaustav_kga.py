@@ -1,3 +1,4 @@
+import gc
 import math
 import numpy as np
 import torch
@@ -17,7 +18,14 @@ import subprocess
 # set random seed for reproducibility
 torch.manual_seed(42)
 
-training_file = "training.log"
+option = 3
+
+if option == 1:
+    training_file = "training_8.log"
+elif option == 2:
+    training_file = "training_16.log"
+else:
+    training_file = "training_32.log"
 
 
 # Custom handler class that flushes after every write
@@ -72,6 +80,14 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # GPU SELECTION UTILITY
 # ============================================================================
+
+
+def cleanup_gpu_memory():
+    """Aggressively clean up GPU memory."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
 
 
 def get_least_used_gpu():
@@ -370,14 +386,7 @@ class UltrasoundVideoDataset(Dataset):
 
         frames = torch.stack(frames)
 
-        # FIX: Use actual positions in the loaded sequence
-        # These correspond to positions in the frames tensor (0-indexed)
-        num_loaded = len(frame_indices)
-        keyframe_indices = torch.tensor(
-            [0, num_loaded // 2, num_loaded - 1], dtype=torch.long
-        )
-
-        return frames, label, keyframe_indices
+        return frames, label
 
 
 def video_dataloader(
@@ -493,53 +502,22 @@ class CenterLoss(nn.Module):
     Centers are updated with the paper's equation (no gradient descent).
     """
 
-    def __init__(self, num_classes, feature_dim, device="cuda"):
-        super(CenterLoss, self).__init__()
-        self.num_classes = num_classes
+    def __init__(self, num_classes, feature_dim=512, device="cuda"):
+        super().__init__()
+        self.centers = nn.Parameter(
+            torch.randn(num_classes, feature_dim, device=device) * 0.01
+        )
         self.feature_dim = feature_dim
-        self.device = torch.device(device)
-        # Use buffer so centers are not updated by optimizer / autograd
-        centers = torch.zeros(num_classes, feature_dim, device=self.device)
-        self.register_buffer("centers", centers)
 
     def forward(self, features, labels):
-        """
-        features: (B, D) feature vectors (pooled)
-        labels: (B,)
-        returns scalar loss (averaged over batch)
-        """
         batch_size = features.size(0)
-        centers_batch = self.centers[labels]  # (B, D)
-        loss = torch.sum((features - centers_batch) ** 2) / (2.0 * batch_size)
+        centers_batch = self.centers[labels]
+
+        # Standard center loss
+        loss = torch.sum((features - centers_batch) ** 2)
+        loss = loss / (2.0 * batch_size * self.feature_dim)
+
         return loss
-
-    @torch.no_grad()
-    def update_centers(self, features, labels, alpha):
-        """
-        Update centers using Wen et al. Eq.4:
-            Δc_j = sum_{i: y_i=j} (c_j - x_i) / (1 + count_j)
-            c_j <- c_j - alpha * Δc_j
-
-        features: (B, D) tensor (should be detached)
-        labels: (B,) tensor
-        alpha: scalar learning rate for centers
-        """
-        device = self.centers.device
-        features = features.to(device)
-        labels = labels.to(device)
-
-        unique_labels = labels.unique()
-        for lbl in unique_labels:
-            mask = labels == lbl
-            count = mask.sum().item()
-            if count == 0:
-                continue
-            features_j = features[mask]  # (count, D)
-            c_j = self.centers[lbl]  # (D,)
-            # Δc_j = sum (c_j - x_i) / (1 + count)
-            diff = (c_j.unsqueeze(0) - features_j).sum(dim=0) / (1.0 + count)
-            # update
-            self.centers[lbl] = c_j - alpha * diff
 
 
 class CoherenceLoss(nn.Module):
@@ -787,6 +765,17 @@ class ImageClassificationNetwork(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
         """To-DO: Experiment with adding LayerNorm here"""
+        # Projection to lower dimension
+        # self.projection = nn.Sequential(
+        #     nn.Linear(2048, 512),
+        #     nn.BatchNorm1d(512),  # Stabilize
+        #     nn.ReLU()
+        # )
+
+        # self.classifier = nn.Sequential(
+        #     nn.Dropout(0.5),
+        #     nn.Linear(512, num_classes)
+        # )
         self.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(2048, num_classes))
 
     def forward(self, images: torch.Tensor, return_features: bool = False):
@@ -794,6 +783,12 @@ class ImageClassificationNetwork(nn.Module):
         feats = self.backbone(images)
         pooled = self.global_pool(feats).view(feats.size(0), -1)  # (B, 2048)
         logits = self.classifier(pooled)
+
+        """To-DO: Experiment with adding LayerNorm here"""
+        # pooled = self.global_pool(feats).view(feats.size(0), -1)  # 2048-D
+
+        # projected = self.projection(pooled)  # 512-D
+        # logits = self.classifier(projected)
 
         if return_features:
             return logits, pooled  # Return 2048-dim features for center loss
@@ -822,10 +817,7 @@ def calculate_youden_threshold(model, val_loader, device):
 
     with torch.no_grad():
         for x in val_loader:
-            if len(x) == 2:
-                inputs, labels = x
-            else:
-                inputs, labels, _ = x
+            inputs, labels = x
             inputs = inputs.to(device)
             labels = labels.to(device)
 
@@ -852,7 +844,7 @@ def train_joint_epoch(
     image_loader,
     video_loader,
     main_optimizer,
-    # center_optimizer,
+    center_optimizer,
     device,
     center_loss_fn,
     main_scheduler,
@@ -915,7 +907,7 @@ def train_joint_epoch(
 
         # zero grads
         main_optimizer.zero_grad(set_to_none=True)
-        # center_optimizer.zero_grad(set_to_none=True)
+        center_optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             img_logits, img_features = image_model(images, return_features=True)
@@ -930,7 +922,7 @@ def train_joint_epoch(
 
         img_scaler.scale(img_loss).backward()
         img_scaler.unscale_(main_optimizer)
-        # img_scaler.unscale_(center_optimizer)
+        img_scaler.unscale_(center_optimizer)
 
         # Clip gradients
         torch.nn.utils.clip_grad_norm_(
@@ -944,14 +936,8 @@ def train_joint_epoch(
 
         # Step both optimizers
         img_scaler.step(main_optimizer)
-        # img_scaler.step(center_optimizer)
+        img_scaler.step(center_optimizer)
         img_scaler.update()
-
-        # Update centers per-paper (use detached features)
-        # img_features is the pooled 2048-d vector returned by ImageClassificationNetwork
-        center_loss_fn.update_centers(
-            img_features.detach(), img_labels.detach(), alpha_center
-        )
 
         total_image_loss += img_loss.item()
         _, img_pred = img_logits.max(1)
@@ -960,10 +946,10 @@ def train_joint_epoch(
 
         # ========== VIDEO BATCH ==========
         try:
-            frames, vid_labels, _ = next(video_iter)
+            frames, vid_labels = next(video_iter)
         except StopIteration:
             video_iter = iter(video_loader)
-            frames, vid_labels, _ = next(video_iter)
+            frames, vid_labels = next(video_iter)
 
         frames = frames.to(device, non_blocking=True)
         vid_labels = vid_labels.to(device, non_blocking=True)
@@ -1054,8 +1040,14 @@ def train_joint_epoch(
             }
         )
 
-        # Free memory
-        del images, img_labels, frames, vid_labels
+        # CRITICAL: Delete tensors and clear cache
+        del frames, vid_labels, vid_logits, vid_features, vid_loss
+        del vid_cls_loss, frame_cls_loss, img_loss
+        del img_logits, img_features, images, img_labels
+        del frame_features, frame_pooled, frame_logits, frame_labels
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     return (
         total_image_loss / iters_done,  # average image loss
@@ -1083,7 +1075,7 @@ def train_joint_kga_net(
     mining="hard",
     save_dir="checkpoints/joint_model",
     num_workers=4,
-    early_stopping=True,
+    early_stopping=False,
     patience=15,
     device="cpu",
 ):
@@ -1179,32 +1171,21 @@ def train_joint_kga_net(
 
     # ==================== OPTIMIZERS ====================
     # Paper uses single optimizer for all parameters
-    all_params = (
+    main_optimizer = torch.optim.SGD(
         list(shared_backbone.parameters())
         + list(image_model.classifier.parameters())
-        + list(video_model.frame_attention.parameters())
-        + list(video_model.classifier.parameters())
-    )
-
-    main_optimizer = torch.optim.SGD(
-        all_params,
+        + list(video_model.parameters()),
         lr=learning_rate,
         momentum=0.9,
         weight_decay=1e-4,
     )
 
-    # Center optimizer - uses higher LR but scaled with alpha_center
-    # Standard center loss practice: lr inversely proportional to alpha
-    # REMOVED: center_optimizer is not needed
-    # Centers are updated manually via center_loss_fn.update_centers()
-    # which implements the paper's Eq. 4 closed-form rule
-
-    # center_optimizer = torch.optim.SGD(
-    #     center_loss_fn.parameters(),
-    #     lr=0.5
-    #     / alpha_center,  # Inverse scale: if alpha↑, centers already get strong gradients
-    #     momentum=0.9,
-    # )
+    # Separate center optimizer (higher LR)
+    center_optimizer = torch.optim.SGD(
+        center_loss_fn.parameters(),
+        lr=0.5,  # 100× higher for fast center convergence
+        momentum=0.9,
+    )
 
     # ==================== SCHEDULERS ====================
     iterations_per_epoch = min(len(image_train_loader), len(video_train_loader))
@@ -1244,21 +1225,21 @@ def train_joint_kga_net(
         logger.info(f"\nEpoch {epoch+1}/{num_epochs} (Iter {global_iter}/{total_iter})")
 
         img_loss, vid_loss, img_acc, vid_acc, iters_done = train_joint_epoch(
-            image_model,
-            video_model,
-            image_train_loader,
-            video_train_loader,
-            main_optimizer,
-            # center_optimizer,
-            device,
-            center_loss_fn,
-            main_scheduler,
-            alpha_center,
-            video_loss_type,
-            mining,
-            lambda_coh,
-            global_iter,
-            total_iter,
+            image_loader=image_train_loader,
+            video_loader=video_train_loader,
+            image_model=image_model,
+            video_model=video_model,
+            main_optimizer=main_optimizer,
+            center_optimizer=center_optimizer,
+            device=device,
+            center_loss_fn=center_loss_fn,
+            main_scheduler=main_scheduler,
+            alpha_center=alpha_center,
+            lambda_coh=lambda_coh,
+            video_loss_type=video_loss_type,
+            mining=mining,
+            start_iter=global_iter,
+            max_iters=total_iter,
         )
 
         global_iter += iters_done
@@ -1346,7 +1327,9 @@ def train_joint_kga_net(
                     "val_acc": val_vid_acc,
                     "threshold": video_threshold,
                 },
-                os.path.join(save_dir, f"best_video_model_{vid_loss_type_str}.pth"),
+                os.path.join(
+                    save_dir, f"best_video_model_{vid_loss_type_str}_{num_frames}.pth"
+                ),
             )
             logger.info(f"✓ Saved best video model (Acc: {val_vid_acc:.2f}%)")
 
@@ -1356,6 +1339,7 @@ def train_joint_kga_net(
     logger.info(f"Best Video Acc: {best_vid_acc:.2f}%")
     logger.info("=" * 70)
 
+    cleanup_gpu_memory()
     return image_model, video_model
 
 
@@ -1369,7 +1353,7 @@ def validate(model, val_loader, device):
 
     with torch.no_grad():
         pbar = tqdm(val_loader, desc="Validation")
-        for frames, labels, _ in pbar:
+        for frames, labels in pbar:
             frames = frames.to(device)
             labels = labels.to(device)
 
@@ -1467,25 +1451,31 @@ if __name__ == "__main__":
     # Path to save Checkpoints
     SAVE_DIR = "notebooks/joint_checkpoints"
 
+    device = select_best_device()
+
+    # torch.cuda.set_per_process_memory_fraction(0.9)  # Use 90% of GPU memory
+    # Enable persistent kernels for faster execution
+    torch.backends.cudnn.benchmark = True
+
     print("=" * 70)
     print("KGA-Net Training Pipeline (Paper Implementation)")
     print("=" * 70)
-    for LOSS_TYPE, MINING in [
-        ("coherence", None),
-        ("triplet_standard", "hard"),
-        ("triplet_standard", "semi-hard"),
-        ("triplet_standard", "all"),
-    ]:
-        # for ALPHA_CENTER in [0.1, 0.5, 1.0]:
+    # for LOSS_TYPE, MINING in [
+    #     ("coherence", None),
+    #     ("triplet_standard", "hard"),
+    #     ("triplet_standard", "semi-hard"),
+    #     ("triplet_standard", "all"),
+    # ]:
+    for ALPHA_CENTER in [0, 0.6, 0.8, 1]:
         # for NUM_FRAMES in [32]:
-        for NUM_FRAMES in [
-            8,
-            16,
-            # 32,
-            # 64,
-        ]:
+        if option == 1:
+            l = [8]
+        elif option == 2:
+            l = [16]
+        else:
+            l = [32]
+        for NUM_FRAMES in l:
             # Select best GPU before each training run
-            device = select_best_device()
 
             logger.info("\n" + "=" * 70)
             logger.info("Training Configuration:")
@@ -1501,7 +1491,7 @@ if __name__ == "__main__":
             logger.info("=" * 70)
 
             try:
-                image_model, video_model = train_joint_kga_net(
+                trained_model = train_joint_kga_net(
                     # Image dataset
                     image_root_dir=IMAGE_ROOT_DIR,
                     image_annotation_file=IMAGE_ANNOTATION,
@@ -1519,11 +1509,23 @@ if __name__ == "__main__":
                     num_frames=NUM_FRAMES,
                     save_dir=SAVE_DIR,
                     early_stopping=True,
-                    patience=15,
+                    patience=20,
                     device=device,
                 )
+                # CRITICAL: Clean up after each training run
+                del trained_model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                gc.collect()
             except Exception as e:
-                logger.error(f"Training failed with error: {e}", exc_info=True)
+                logger.error(
+                    f"Training failed for {NUM_FRAMES} frames with error: {e}",
+                    exc_info=True,
+                )
+                # Clean up on error too
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                gc.collect()
                 continue
 
     print("\n✓ Training completed successfully!")
