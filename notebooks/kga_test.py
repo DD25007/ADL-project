@@ -18,7 +18,7 @@ import subprocess
 # set random seed for reproducibility
 torch.manual_seed(42)
 
-option = 4
+option = 2
 
 if option == 1:
     training_file = "training_8.log"
@@ -27,7 +27,7 @@ elif option == 2:
 elif option == 3:
     training_file = "training_32.log"
 else:
-    training_file = "training_full_16.log"
+    training_file = "training_reduced.log"
 
 
 # Custom handler class that flushes after every write
@@ -1243,28 +1243,31 @@ if __name__ == "__main__":
     # Path to save Checkpoints
     SAVE_DIR = "notebooks/joint_checkpoints"
 
-    # device = select_best_device()
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = select_best_device()
+    # device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
     print("=" * 70)
     print("KGA-Net Training Pipeline")
     print("=" * 70)
 
-    for LOSS_TYPE, MINING in [
-        ("coherence", None),
-        ("triplet_standard", "hard"),
-        ("triplet_standard", "semi-hard"),
-        ("triplet_standard", "all"),
-    ]:
-        for ALPHA_CENTER, NUM_FRAMES in [(1, 8), (0.6, 16), (0.8, 16), (0.8, 32)]:
-            # for ALPHA_CENTER in [0.2, 0.4, 0.6, 0.8, 1]:
-            #     if option == 1:
-            #         l = [8]
-            #     elif option == 2:
-            #         l = [16]
-            #     else:
-            #         l = [32]
-            #     for NUM_FRAMES in l:
+    # for LOSS_TYPE, MINING in [
+    #     ("coherence", None),
+    #     ("triplet_standard", "hard"),
+    #     ("triplet_standard", "semi-hard"),
+    #     ("triplet_standard", "all"),
+    # ]:
+    #     for ALPHA_CENTER, NUM_FRAMES in [
+    #         (0.4, 64),
+    #         (1, 64),
+    #     ]:
+    for ALPHA_CENTER in [0.2, 0.4, 0.6, 0.8, 1]:
+        if option == 1:
+            l = [8]
+        elif option == 2:
+            l = [16]
+        else:
+            l = [32]
+        for NUM_FRAMES in l:
 
             logger.info("\n" + "=" * 70)
             logger.info("Training Configuration:")
